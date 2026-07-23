@@ -213,11 +213,14 @@ class UartNartisRfComponent : public uart::UARTComponent, public Component {
 
   // --- RF RX accumulation (drain_rx fills rf_rx_buf_ across loop() calls) ---
   size_t rf_rx_accum_len_{0};
-  uint32_t rf_rx_first_byte_ms_{0};
-  /// Once the first RX bytes arrive we keep draining for this long, then carve the
-  /// frame out by length+CRC. Fixed-length capture keeps the FIFO fed with noise
-  /// after the real reply, so we drain a little past it and let CRC find the frame.
-  static constexpr uint32_t RF_RX_DRAIN_WINDOW_MS = 150;
+  uint32_t rf_rx_last_chunk_ms_{0};
+  /// Stop draining once we have the whole frame (first byte = OLEN => frame is
+  /// OLEN + 3 bytes incl. the 2-byte CRC), or, as a fallback, once a full byte cap
+  /// is reached or no new chunk has arrived for RF_RX_END_GAP_MS. A fixed time
+  /// window does NOT work: at 1.2 kbps the FIFO threshold only fires every ~100 ms,
+  /// so the frame must be bounded by length, not by elapsed time.
+  static constexpr size_t RF_RX_DRAIN_CAP = 96;
+  static constexpr uint32_t RF_RX_END_GAP_MS = 400;
 
   // --- RX center offset (freq codes; 1 code ~= 6.199 Hz) ---
   // The meter's reply sits a few kHz above our TX; this shifts the RX-half LO to

@@ -583,7 +583,7 @@ RfStatus UartNartisRfComponent::rf_enter_rx_mode_() {
     return RfStatus::ERROR;
   }
   this->rf_rx_accum_len_ = 0;
-  this->rf_rx_first_byte_ms_ = 0;
+  this->rf_rx_last_chunk_ms_ = millis();
   ESP_LOGV(TAG, "rf_enter_rx_mode_: RX armed (center offset %d codes)", this->rx_center_offset_);
   return RfStatus::OK;
 }
@@ -593,14 +593,15 @@ RfStatus UartNartisRfComponent::rf_poll_receive_(uint8_t *out, size_t out_cap, s
     return RfStatus::ERROR;
   }
   *out_len = 0;
+  const uint32_t now = millis();
+  const size_t cap = (out_cap < RF_RX_DRAIN_CAP) ? out_cap : RF_RX_DRAIN_CAP;
 
   // Drain full RX_FIFO_TH chunks (non-blocking; returns 0 when the line is low).
-  if (this->rf_rx_accum_len_ + FIFO_TH_VALUE <= out_cap) {
-    const size_t got = this->hal_.drain_rx(out + this->rf_rx_accum_len_, out_cap - this->rf_rx_accum_len_);
+  if (this->rf_rx_accum_len_ + FIFO_TH_VALUE <= cap) {
+    const size_t got = this->hal_.drain_rx(out + this->rf_rx_accum_len_, cap - this->rf_rx_accum_len_);
     if (got > 0) {
-      if (this->rf_rx_accum_len_ == 0)
-        this->rf_rx_first_byte_ms_ = millis();
       this->rf_rx_accum_len_ += got;
+      this->rf_rx_last_chunk_ms_ = now;
     }
   }
 
@@ -608,17 +609,24 @@ RfStatus UartNartisRfComponent::rf_poll_receive_(uint8_t *out, size_t out_cap, s
     return RfStatus::NO_DATA;  // nothing yet - RX_RF timeout governs give-up
   }
 
-  // Fixed-length capture keeps feeding the FIFO with noise after the reply, so
-  // we don't wait for silence: once the first bytes have arrived we drain for a
-  // short window (or until the buffer is nearly full), then hand the block to
-  // rf_unpack_ to carve the real frame out by length + CRC.
-  if ((millis() - this->rf_rx_first_byte_ms_) >= RF_RX_DRAIN_WINDOW_MS ||
-      this->rf_rx_accum_len_ + FIFO_TH_VALUE > out_cap) {
-    *out_len = this->rf_rx_accum_len_;
+  // The first received byte is OLEN, so the whole frame is OLEN + 3 bytes (OLEN +
+  // content + 2-byte CRC). Fixed-length capture keeps the FIFO fed with noise past
+  // the real frame, so once the frame is fully in we return EXACTLY those bytes and
+  // drop the trailing noise (a timer would truncate; the byte cap / inter-chunk gap
+  // are only fallbacks when OLEN looks bogus and no clean frame is coming).
+  const size_t olen = out[0];
+  if (olen >= 3 && this->rf_rx_accum_len_ >= olen + 3) {
+    *out_len = olen + 3;  // OLEN byte + content + 2-byte CRC (trim noise)
     this->rf_rx_accum_len_ = 0;
     return RfStatus::OK;
   }
-  return RfStatus::BUSY;  // keep draining within the window
+  if (this->rf_rx_accum_len_ + FIFO_TH_VALUE > cap ||
+      (now - this->rf_rx_last_chunk_ms_) >= RF_RX_END_GAP_MS) {
+    *out_len = this->rf_rx_accum_len_;  // fallback: hand over what we have, let the carve scan
+    this->rf_rx_accum_len_ = 0;
+    return RfStatus::OK;
+  }
+  return RfStatus::BUSY;  // keep draining until the frame is complete
 }
 
 RfStatus UartNartisRfComponent::rf_set_idle_() {
