@@ -1,67 +1,53 @@
-# ESPHome Virtual UART <-> RF433 Bridge (Nartis)
+[СПОДЭС/DLMS/COSEM](https://github.com/latonita/esphome-dlms-cosem) •
+[МЭК-61107/IEC-61107](https://github.com/latonita/esphome-iec61107-meter) •
+[Энергомера МЭК/IEC](https://github.com/latonita/esphome-energomera-iec) •
+[Энергомера CE](https://github.com/latonita/esphome-energomera-ce) •
+[СПб ЗИП ЦЭ2727А](https://github.com/latonita/esphome-ce2727a-meter) •
+[Ленэлектро ЛЕ-2](https://github.com/latonita/esphome-le2-meter) •
+[Пульсар-М](https://github.com/latonita/esphome-pulsar-m) •
+[Энергомера BLE](https://github.com/latonita/esphome-energomera-ble) •
+[Нартис RF433](https://github.com/latonita/esphome-nartis-rf-meter) •
+[Нартис RF433-2](https://github.com/latonita/esphome-uart-nartis-rf) •
+[Nordic UART (BLE NUS)](https://github.com/latonita/esphome-nordic-uart-ble) •
 
-A component that **presents a UART** (`uart::UARTComponent`) but relays every
-request/reply over a 433/443 MHz radio (CMT2300A) instead of over serial wires.
-Any component that already knows how to talk to a meter over UART can bind to
-this bridge - by pointing its `uart_id` at it - and works unchanged against an
-RF-only meter. The RF hop is invisible: the upstream writes request bytes and
-polls for a reply exactly as against a real serial link.
+---
 
-This mirrors the `esphome-uart-nordic` BLE bridge, which presents the same
-virtual-UART interface over a BLE link.
+# Виртуальный мост UART <-> RF433-2 (Nartis 2024+) для ESPHome
 
-Target: Nartis I100/I300 electricity meters ("rf-433-2" / d101-2 protocol) via a
-CMT2300A transceiver on an ESP32.
+Компонент, который **предоставляет UART** (`uart::UARTComponent`), но передаёт
+каждый запрос/ответ по радиоканалу 433/443 МГц (CMT2300A), а не по проводам.
+Любой компонент, умеющий общаться со счётчиком «по UART», может подключиться к
+этому мосту — указав в своём `uart_id` его идентификатор — и работать без
+изменений с радиосчётчиком. Радиоучасток невидим: вышестоящий компонент пишет
+байты запроса и читает ответ ровно так же, как через настоящий последовательный
+порт.
 
-## Status
+Использовать в комплекте с [СПОДЭС/DLMS/COSEM](https://github.com/latonita/esphome-dlms-cosem)
 
-- **Working:** virtual-UART interface, non-blocking bridge state machine, CMT2300A
-  PHY (443.9 MHz, asymmetric TX/RX channel, chunked TX for frames > 64 B), the
-  type-5A DLMS-HDLC envelope (build on TX, CRC-carve + unwrap on RX), CRC-16/X.25,
-  and link-layer ARQ.
-- **Fixed for now:** the operating frequency is hard-set to **443.9 MHz**. The
-  serial-derived frequency is computed and logged but not yet programmed (the
-  arbitrary-frequency register encoding is TODO).
+Назначение: счётчики электроэнергии Nartis I100/I300 (протокол "RF-433-2" /
+Д101-2) через трансивер CMT2300A на ESP32.
 
-## How it works
+## Статус
 
-```
-   upstream UART consumer                   CMT2300A RF
-  +---------------------+                 +---------------------+             +--------+
-  |  DLMS/COSEM reader  | -write(HDLC)->  |  pack RF frame      | ->  TX ->   | NARTIS |
-  | (esphome-dlms-cosem)|                 |                     |   over air  | meter  |
-  |  bound via uart_id  | <-read(HDLC) <--|  unpack frame + CRC | <-  RX <-   |        |
-  +---------------------+                 +---------------------+             +--------+
-```
+- **Работает:** интерфейс виртуального UART, неблокирующая машина состояний
+  моста, PHY CMT2300A (443.9 МГц, асимметричный канал TX/RX, чанковая передача
+  для кадров > 64 Б), конверт type-5A DLMS-HDLC (сборка при TX, выделение по CRC
+  и распаковка при RX), CRC-16/X.25 и ARQ канального уровня.
+- **Пока зафиксировано:** рабочая частота жёстко задана как **443.9 МГц**.
+  Частота, вычисляемая по серийному номеру, рассчитывается и логируется, но пока
+  не программируется (кодирование регистров произвольной частоты — TODO).
 
-1. **Collect** - the upstream writes a request (a complete DLMS-HDLC `7E..7E`
-   frame) via `write_array()`; the end is detected by an idle gap of `request_gap`
-   (default `100ms`), or by the upstream calling `flush()`.
-2. **Pack** - wrap the HDLC frame in the d101-2 type-5A envelope
-   (`98 F3 | OLEN | 00 01 | HLEN | 5A | serial | hdlc | A5 | CRC16`).
-3. **Transmit** - send it over RF (narrow ~4 kHz TX profile, LSB-first on air,
-   FIFO chunk-refilled for frames larger than the 64-byte FIFO).
-4. **Receive** - switch to the wide ~28 kHz RX profile centred on the reply and
-   drain the RX FIFO for up to `rf_rx_timeout`.
-5. **Unpack** - CRC-carve the reply (`OLEN` + CRC-16/X.25), strip the
-   `OLEN | 00 01 | HLEN` transport header, and push the inner HDLC frame into the
-   reply FIFO, from which the upstream drains it via `read_array()`/`available()`.
+## Подключение (CMT2300A, программный 3-проводной SPI + INT)
 
-The bridge is strictly half-duplex, request/reply. On a bad CRC or no reply it
-retransmits (see **ARQ** below). Bytes written while an RF transaction is in
-flight are buffered as the *next* request.
-
-## Wiring (CMT2300A, bit-bang 3-wire SPI + INT)
-
-| Signal | Purpose |
+| Сигнал | Назначение |
 | --- | --- |
-| `pin_sdio` | bidirectional data (MOSI/MISO) |
-| `pin_sclk` | serial clock |
-| `pin_csb`  | chip-select for register access |
-| `pin_fcsb` | chip-select for FIFO access |
-| `pin_gpio3`| chip INT2 output (RX_FIFO_TH / TX_FIFO_TH), polled for FIFO draining |
+| `pin_sdio` | двунаправленные данные (MOSI/MISO) |
+| `pin_sclk` | тактовый сигнал |
+| `pin_csb`  | выбор кристалла для доступа к регистрам |
+| `pin_fcsb` | выбор кристалла для доступа к FIFO |
+| `pin_gpio3`| выход INT2 микросхемы (RX_FIFO_TH / TX_FIFO_TH), опрашивается для вычитки FIFO |
 
-## YAML configuration
+## Конфигурация YAML
 
 ```yaml
 external_components:
@@ -69,10 +55,10 @@ external_components:
     components: [uart_nartis_rf]
     refresh: 1s
 
-# The bridge IS a virtual UART - it takes NO uart_id.
+# Мост САМ является виртуальным UART — он НЕ принимает uart_id.
 uart_nartis_rf:
   id: rf_uart
-  address: "023240271060"   # meter serial (12 digits)
+  address: "023240271060"   # серийный номер счётчика (12 цифр)
   pin_sdio: GPIO19
   pin_sclk: GPIO18
   pin_csb: GPIO5
@@ -84,77 +70,48 @@ uart_nartis_rf:
   rf_retries: 2
   rx_center_offset: 758
 
-# A UART-speaking meter component binds to the bridge instead of a real `uart:`.
+# Компонент-счётчик, говорящий по UART, подключается к мосту вместо реального `uart:`.
 # dlms_cosem:
 #   uart_id: rf_uart
 #   ...
 ```
 
-## Configuration variables
+## Параметры конфигурации
 
-- **id** (Required): Component ID. Point a meter component's `uart_id` at this.
-- **address** (Required, string): Meter serial, exactly 12 digits (e.g.
-  `"023240271060"`). Used as the BCD little-endian serial in the RF envelope and
-  (in future) to derive the frequency.
-- **pin_sdio / pin_sclk / pin_csb / pin_fcsb** (Required): CMT2300A SPI pins.
-- **pin_gpio3** (Required): CMT2300A INT2 pin (input).
-- **request_gap** (Optional, time): Idle gap on the write side that marks the end
-  of a request. Default `100ms`. (An upstream `flush()` finalizes immediately.)
-- **rf_tx_timeout** (Optional, time): TX-completion timeout. Default `1000ms`.
-- **rf_rx_timeout** (Optional, time): How long to wait for an RF reply, per
-  attempt. Default `1000ms`.
-- **rf_retries** (Optional, int 0-10): RF-layer retransmissions on no-reply / bad
-  CRC. `0` = pure transparent (no ARQ). Default `2` (up to 3 attempts).
-- **rx_center_offset** (Optional, int): RX center offset in CMT2300A frequency
-  codes (1 code ~= 6.199 Hz), to sit on the meter's reply carrier (a few kHz above
-  TX). Default `758` (~+4.7 kHz, proven). The wide RX profile + AFC absorb drift.
+- **id** (обязательно): идентификатор компонента. Укажите его в `uart_id`
+  компонента-счётчика.
+- **address** (обязательно, строка): серийный номер счётчика, ровно 12 цифр
+  (например `"023240271060"`). Используется как серийник в формате BCD
+  little-endian в радиоконверте и (в будущем) для вычисления частоты.
+- **pin_sdio / pin_sclk / pin_csb / pin_fcsb** (обязательно): пины SPI CMT2300A.
+- **pin_gpio3** (обязательно): пин INT2 CMT2300A (вход).
+- **request_gap** (опционально, время): пауза бездействия на стороне записи,
+  отмечающая конец запроса. По умолчанию `100ms`. (Вызов `flush()` вышестоящим
+  компонентом завершает запрос немедленно.)
+- **rf_tx_timeout** (опционально, время): таймаут завершения передачи. По
+  умолчанию `1000ms`.
+- **rf_rx_timeout** (опционально, время): сколько ждать радиоответа за одну
+  попытку. По умолчанию `1000ms`.
+- **rf_retries** (опционально, целое 0-10): число повторов на радиоуровне при
+  отсутствии ответа / плохом CRC. `0` = полностью прозрачно (без ARQ). По
+  умолчанию `2` (до 3 попыток).
+- **rx_center_offset** (опционально, целое): смещение центра RX в кодах частоты
+  CMT2300A (1 код ≈ 6.199 Гц), чтобы попасть на несущую ответа счётчика (на
+  несколько кГц выше TX). По умолчанию `758` (≈ +4.7 кГц, проверено). Например
+  `1900` ≈ +11.8 кГц. Широкий профиль RX + AFC компенсируют обычный уход частоты.
 
-## ARQ (link-layer retry) and timeout budgeting
+## ARQ (повторы канального уровня) и бюджет таймаутов
 
-The bridge owns fast, bounded retransmission: on a bad-CRC reply or no reply
-within `rf_rx_timeout`, it re-packs (fresh frame) and resends, up to `rf_retries`
-times, then gives up (delivering nothing, so the upstream's own retry takes over).
+Мост сам выполняет быстрые ограниченные повторы: при ответе с плохим CRC или
+отсутствии ответа в течение `rf_rx_timeout` он заново собирает кадр и
+пересылает его, до `rf_retries` раз, после чего сдаётся (ничего не отдаёт, и
+управление переходит к собственному повтору вышестоящего компонента).
 
-Because the upstream (e.g. `dlms_cosem`) simply waits on its receive timeout while
-the bridge works, the two retry layers **serialize** rather than fight - as long
-as `(rf_retries + 1) * rf_rx_timeout + tx_time` stays **under** the upstream's
-receive timeout. Set the upstream `receive_timeout` generously (seconds).
+Поскольку вышестоящий компонент (например `dlms_cosem`) просто ждёт по своему
+таймауту приёма, пока мост работает, два уровня повторов **не конфликтуют**, а
+выстраиваются последовательно — при условии, что
+`(rf_retries + 1) * rf_rx_timeout + tx_time` **меньше** таймаута приёма
+вышестоящего компонента. Задавайте `receive_timeout` вышестоящего компонента с
+запасом (секунды).
 
-Diagnostic counters (logged): no-reply, CRC errors, retries, give-ups.
-
-## Automations
-
-- **on_uart_message**: a complete request was collected (just before RF TX).
-- **on_rf_reply**: a valid reply was received and queued back to the upstream.
-- **on_rf_timeout**: no valid reply after exhausting `rf_retries`.
-
-## Radio / protocol summary
-
-- **PHY:** 2-FSK, 1.2 kbps, `0x55` preamble, sync `98 f3`, LSB-first on air, no
-  whitening, no RF-layer encryption. Asymmetric channel: narrow (~4 kHz) TX,
-  wide (~28 kHz) RX centred on the reply.
-- **Envelope (type-5A, DLMS-HDLC):**
-  - TX (client->server): `98 F3 | OLEN | 00 01 | HLEN | 5A | serial(6) | hdlc | A5 | CRC16`
-  - RX (server->client): `98 F3 | OLEN | 00 01 | HLEN | hdlc | CRC16` (no 5A/serial/A5)
-  - `OLEN` = all bytes after OLEN excluding the CRC; `HLEN = OLEN - 1`; `CRC` is
-    CRC-16/X.25 over `OLEN..end`, little-endian. The `0xA5` terminator is required
-    on requests.
-- There is also a separate type-`68` (AES "quick") protocol on the same PHY; this
-  bridge implements the type-`5A` cleartext DLMS-HDLC path only.
-
-## Extending
-
-The radio is behind `rf_*_` hooks in `uart_nartis_rf.cpp` (`rf_init_`, `rf_pack_`,
-`rf_unpack_`, `rf_start_transmit_`, `rf_transmit_done_`, `rf_enter_rx_mode_`,
-`rf_poll_receive_`, `rf_set_idle_`) over the `Cmt2300aHal` driver. Remaining work:
-serial-derived frequency programming (arbitrary-channel register encoding).
-
-## Threading model
-
-All RF work runs in `loop()` as a non-blocking, poll-based state machine on the
-main ESPHome task - **not** a separate thread or CPU core, and it doesn't need
-one. The BLE bridge only looks event-driven because the ESP32 BLE stack forces
-callbacks from its own task; an SPI-driven radio is master-polled with no external
-event source, so a cooperative polled state machine is the right fit. The one
-blocking spot is `transmit()` (a few tens of ms of airtime); everything else
-returns quickly and resumes next pass.
+Диагностические счётчики (в логах): нет ответа, ошибки CRC, повторы, отказы.
