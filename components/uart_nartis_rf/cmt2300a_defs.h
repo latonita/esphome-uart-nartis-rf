@@ -142,11 +142,15 @@ static constexpr uint8_t DATA_RATE_TX_BANK[24] = {
     0x19, 0x0C, 0x00, 0xBB, 0xC8, 0x9B, 0x0A, 0x0B, 0x9F, 0x39, 0x29, 0x29,
     0xC0, 0xA2, 0x54, 0x53, 0x00, 0x00, 0xB4, 0x00, 0x00, 0x01, 0x00, 0x00
 };
-// RX profile: WIDE ~28 kHz deviation centred on the reply (loaded by rx init).
-// The reply is ~25 kHz deviation (tones 443.880/443.930); the wide profile keeps
-// both tones inside a flat passband. Same baud (CDR A2 54), same freq bank.
+// RX profile: matched to the meter's reply - 25 kHz deviation, 1.2 kbps, AFC on
+// (loaded by rx init; TX stays narrow). RFPDK export 2026-07-24 with Rx Xtal Tol
+// tightened to 5 ppm so Auto-Select picks a narrower channel filter: the reply is
+// a very high modulation-index signal (+-25 kHz dev at 1.2 kbps, h~=41) and arrives
+// weak, so a tighter filter cuts noise -> fewer discriminator spurious edges -> the
+// counting CDR stops slipping bits. Diff vs the prior 28 kHz/20 ppm bank: reg 0x24
+// E2->CA, 0x26 11->0F (dev 28->25 kHz), 0x27 0B->02 (bandwidth). Same baud, freq bank.
 static constexpr uint8_t DATA_RATE_RX_BANK[24] = {
-    0x19, 0x0C, 0x10, 0xBB, 0xE2, 0xDE, 0x11, 0x0B, 0xDF, 0x26, 0x29, 0x29,
+    0x19, 0x0C, 0x10, 0xBB, 0xCA, 0xDE, 0x0F, 0x02, 0xDF, 0x26, 0x29, 0x29,
     0xC0, 0xA2, 0x54, 0x53, 0x00, 0x00, 0xB4, 0x00, 0x00, 0x01, 0x00, 0x00
 };
 // Preamble 10x 0x55, sync 4B (value F6 55 55 55), fixed-length, no CRC/whiten.
