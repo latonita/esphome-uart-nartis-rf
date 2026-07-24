@@ -7,6 +7,8 @@
 #include "esphome/core/log.h"
 #include "esphome/core/hal.h"  // esphome::delay / delayMicroseconds / millis
 
+#include <cinttypes>
+
 namespace esphome::uart_nartis_rf {
 
 static const char *const TAG = "cmt2300a_hal";
@@ -286,12 +288,18 @@ bool Cmt2300aHal::transmit(const uint8_t *frame, size_t len) {
   if (!this->wait_for_state(STA_TX))
     ESP_LOGW(TAG, "TX: state not confirmed");
 
+  const bool chunked = tot > FIFO_SIZE_MERGED;
   uint32_t t0 = esphome::millis();
   while (esphome::millis() - t0 < 900) {
     if (this->spi_read_reg(REG_INT_CLR1) & CLR1_TX_DONE_FLG) {
       this->go_standby();
+      const uint32_t dur = esphome::millis() - t0;
       if (written < tot)
         ESP_LOGW(TAG, "TX_DONE but only %zu/%zu written - frame truncated on air", written, tot);
+      // For a chunked (>FIFO) frame, log timing + fill so we can tell a clean send
+      // (dur ~ airtime, written==tot) from a FIFO underrun (dur too short).
+      if (chunked)
+        ESP_LOGW(TAG, "TX done (chunked): %zu/%zu written, %" PRIu32 " ms", written, tot, dur);
       return true;
     }
     // Refill when the TX FIFO has drained to/below threshold (FIFO_TX_TH == 0).
