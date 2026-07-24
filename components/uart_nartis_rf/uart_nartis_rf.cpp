@@ -59,6 +59,7 @@ void UartNartisRfComponent::loop() {
       // A write while idle moves us to COLLECT; bytes buffered during a previous
       // RF transaction are also picked up here.
       if (this->uart_msg_len_ > 0) {
+        this->discard_reply_();  // fresh exchange: drop any stale reply left queued
         this->set_state_(BridgeState::COLLECT);
       }
       break;
@@ -136,6 +137,14 @@ void UartNartisRfComponent::write_array(const uint8_t *data, size_t len) {
   if (data == nullptr || len == 0) {
     return;
   }
+  // A write arriving while an RF exchange is still in flight means the upstream
+  // gave up waiting (its own receive timeout) and started a new request. Mark the
+  // in-flight exchange abandoned so we stop retransmitting it and never deliver its
+  // late reply as the answer to this new request.
+  if (this->state_ == BridgeState::TX_RF || this->state_ == BridgeState::RX_RF) {
+    this->req_abandoned_ = true;
+  }
+
   // Accept bytes at any time. While an RF transaction is in flight (TX_RF/RX_RF)
   // begin_rf_tx_() has already zeroed uart_msg_len_, so these accumulate cleanly
   // as the NEXT request and are sent once we return to IDLE -> COLLECT.
@@ -148,6 +157,7 @@ void UartNartisRfComponent::write_array(const uint8_t *data, size_t len) {
   }
   this->last_write_ms_ = millis();
   if (this->state_ == BridgeState::IDLE) {
+    this->discard_reply_();  // fresh exchange: drop any stale reply from a timed-out one
     this->set_state_(BridgeState::COLLECT);
   }
 }
@@ -229,6 +239,7 @@ void UartNartisRfComponent::begin_rf_tx_() {
   std::memcpy(this->req_buf_.data(), this->uart_msg_buf_.data(), this->req_len_);
   this->uart_msg_len_ = 0;
   this->tx_attempts_ = 0;
+  this->req_abandoned_ = false;  // fresh request: not (yet) superseded by a newer one
   this->start_tx_attempt_();
 }
 
@@ -259,6 +270,16 @@ void UartNartisRfComponent::start_tx_attempt_() {
 }
 
 void UartNartisRfComponent::retry_or_give_up_(const char *reason) {
+  // If the upstream already moved on to a new request, stop burning airtime on the
+  // dead one - drop it and let loop() pick up the buffered new request.
+  if (this->req_abandoned_) {
+    ESP_LOGW(TAG, "RF %s - upstream abandoned the request, stopping retries", reason);
+    this->req_len_ = 0;
+    this->rf_set_idle_();
+    this->set_state_(BridgeState::IDLE);
+    return;
+  }
+
   // ARQ: one send plus rf_retries_ retransmissions. tx_attempts_ counts sends
   // already made (>=1 here), so retry while tx_attempts_ <= rf_retries_.
   //
@@ -287,6 +308,17 @@ void UartNartisRfComponent::retry_or_give_up_(const char *reason) {
 }
 
 void UartNartisRfComponent::finish_rf_rx_(size_t packet_len) {
+  // If the upstream gave up and started a new request, this reply is stale - never
+  // hand it back, or the next request would read the previous answer (desync).
+  if (this->req_abandoned_) {
+    ESP_LOGW(TAG, "RF reply (%zu bytes) arrived after the request was abandoned - discarding", packet_len);
+    this->req_len_ = 0;
+    this->discard_reply_();
+    this->rf_set_idle_();
+    this->set_state_(BridgeState::IDLE);
+    return;
+  }
+
   ESP_LOGW(TAG, "RF RX raw [%zu]: %s", packet_len,
            format_hex_pretty(this->rf_rx_buf_.data(), packet_len).c_str());
 
@@ -317,6 +349,15 @@ void UartNartisRfComponent::finish_rf_rx_(size_t packet_len) {
   this->on_rf_reply_callback_.call();
   this->rf_set_idle_();
   this->set_state_(BridgeState::IDLE);
+}
+
+void UartNartisRfComponent::discard_reply_() {
+  // Drop any queued reply and the one-byte peek cache so a stale answer from a
+  // previous (abandoned/timed-out) exchange can't be read as this request's reply.
+  if (this->rx_buffer_ != nullptr) {
+    this->rx_buffer_->reset();
+  }
+  this->peek_valid_ = false;
 }
 
 void UartNartisRfComponent::enter_fault_(const char *reason) {
@@ -543,7 +584,7 @@ RfStatus UartNartisRfComponent::rf_unpack_(const uint8_t *packet, size_t packet_
         return RfStatus::ERROR;
       std::memcpy(out, hdlc, hdlc_len);
       *out_len = hdlc_len;
-      ESP_LOGD(TAG, "rf_unpack_: CRC-OK, %zu-byte HDLC (body %zu, start %zu)", hdlc_len, body_len, lp);
+      ESP_LOGI(TAG, "rf_unpack_: CRC-OK, %zu-byte HDLC (body %zu, start %zu)", hdlc_len, body_len, lp);
       return RfStatus::OK;
     }
     // CRC-OK but not the expected OLEN|00 01|HLEN|7E..7E layout - hand back the
@@ -555,7 +596,7 @@ RfStatus UartNartisRfComponent::rf_unpack_(const uint8_t *packet, size_t packet_
     ESP_LOGW(TAG, "rf_unpack_: CRC-OK but unexpected reply layout (%zu-byte body)", body_len);
     return RfStatus::OK;
   }
-  ESP_LOGW(TAG, "rf_unpack_: no CRC-OK frame in %zu bytes", packet_len);
+  ESP_LOGE(TAG, "rf_unpack_: no CRC-OK frame in %zu bytes", packet_len);
   return RfStatus::ERROR;  // -> ARQ retransmit
 }
 

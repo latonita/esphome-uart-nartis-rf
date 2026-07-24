@@ -141,6 +141,7 @@ class UartNartisRfComponent : public uart::UARTComponent, public Component {
   void retry_or_give_up_(const char *reason);  // ARQ: retransmit if attempts remain, else give up
   void finish_rf_rx_(size_t packet_len);   // unpack a received packet into the reply FIFO
   void enter_fault_(const char *reason);
+  void discard_reply_();                   // drop any queued reply + peek cache (resync on a new request)
 
   // ==========================================================================
   // RF radio extension points - ALL STUBS.
@@ -196,6 +197,11 @@ class UartNartisRfComponent : public uart::UARTComponent, public Component {
   uint32_t state_enter_ms_{0};
   uint32_t last_write_ms_{0};
   bool force_send_{false};  // set by flush(): finalize the pending request without waiting for the gap
+  // Set when the upstream writes a NEW request while an RF exchange is still in
+  // flight - i.e. it gave up waiting (its own receive timeout). We then stop
+  // retransmitting the dead request and never deliver its (late) reply, so a stale
+  // answer can't desync the next request/reply pair.
+  bool req_abandoned_{false};
 
   // --- ARQ (retransmission) state ---
   // The latched request is kept for the whole exchange so it can be re-packed
