@@ -70,7 +70,7 @@ void UartNartisRfComponent::loop() {
       if (this->uart_msg_len_ > 0 &&
           (this->force_send_ || (now - this->last_write_ms_) >= this->request_gap_ms_)) {
         ESP_LOGD(TAG, "Request complete (%zu bytes)%s", this->uart_msg_len_,
-                 this->force_send_ ? " [flush]" : "");
+                 LOG_STR_ARG(this->force_send_ ? LOG_STR(" [flush]") : LOG_STR("")));
         this->force_send_ = false;
         this->on_uart_message_callback_.call();
         this->begin_rf_tx_();
@@ -82,16 +82,16 @@ void UartNartisRfComponent::loop() {
       if (st == RfStatus::OK) {
         ESP_LOGV(TAG, "RF TX done, switching to RX");
         if (this->rf_enter_rx_mode_() != RfStatus::OK) {
-          this->enter_fault_("failed to enter RF RX mode");
+          this->enter_fault_(LOG_STR("failed to enter RF RX mode"));
           break;
         }
         this->set_state_(BridgeState::RX_RF);
       } else if (st == RfStatus::BUSY) {
         if ((now - this->state_enter_ms_) >= this->rf_tx_timeout_ms_) {
-          this->enter_fault_("RF TX timeout");
+          this->enter_fault_(LOG_STR("RF TX timeout"));
         }
       } else {
-        this->enter_fault_("RF TX error");
+        this->enter_fault_(LOG_STR("RF TX error"));
       }
       break;
     }
@@ -105,10 +105,10 @@ void UartNartisRfComponent::loop() {
       } else if (st == RfStatus::NO_DATA || st == RfStatus::BUSY) {
         if ((now - this->state_enter_ms_) >= this->rf_rx_timeout_ms_) {
           this->rf_no_reply_count_++;
-          this->retry_or_give_up_("no reply");
+          this->retry_or_give_up_(LOG_STR("no reply"));
         }
       } else {
-        this->enter_fault_("RF RX error");
+        this->enter_fault_(LOG_STR("RF RX error"));
       }
       break;
     }
@@ -121,7 +121,7 @@ void UartNartisRfComponent::loop() {
 
     default:
       // Unknown state - fail safe.
-      this->enter_fault_("unknown state");
+      this->enter_fault_(LOG_STR("unknown state"));
       break;
   }
 }
@@ -252,7 +252,7 @@ void UartNartisRfComponent::start_tx_attempt_() {
                                this->rf_tx_buf_.size(), &this->rf_tx_len_);
   if (st != RfStatus::OK) {
     // Packing is deterministic - retrying won't help, so fail safe.
-    this->enter_fault_("RF packing failed");
+    this->enter_fault_(LOG_STR("RF packing failed"));
     return;
   }
 
@@ -263,17 +263,17 @@ void UartNartisRfComponent::start_tx_attempt_() {
   if (st != RfStatus::OK) {
     // Couldn't even start the transmit: treat as a failed attempt so ARQ can
     // retry (the radio may have been momentarily busy).
-    this->retry_or_give_up_("RF transmit start failed");
+    this->retry_or_give_up_(LOG_STR("RF transmit start failed"));
     return;
   }
   this->set_state_(BridgeState::TX_RF);
 }
 
-void UartNartisRfComponent::retry_or_give_up_(const char *reason) {
+void UartNartisRfComponent::retry_or_give_up_(const LogString *reason) {
   // If the upstream already moved on to a new request, stop burning airtime on the
   // dead one - drop it and let loop() pick up the buffered new request.
   if (this->req_abandoned_) {
-    ESP_LOGW(TAG, "RF %s - upstream abandoned the request, stopping retries", reason);
+    ESP_LOGW(TAG, "RF %s - upstream abandoned the request, stopping retries", LOG_STR_ARG(reason));
     this->req_len_ = 0;
     this->rf_set_idle_();
     this->set_state_(BridgeState::IDLE);
@@ -289,7 +289,7 @@ void UartNartisRfComponent::retry_or_give_up_(const char *reason) {
   // (SET/ACTION). This bridge targets meter reads; revisit if writes are added.
   if (this->tx_attempts_ <= this->rf_retries_) {
     this->rf_retry_count_++;
-    ESP_LOGW(TAG, "RF %s - retransmit (attempt %u/%u)", reason,
+    ESP_LOGW(TAG, "RF %s - retransmit (attempt %u/%u)", LOG_STR_ARG(reason),
              (unsigned) (this->tx_attempts_ + 1), (unsigned) (this->rf_retries_ + 1));
     this->rf_set_idle_();
     this->start_tx_attempt_();  // re-pack (fresh frame) + resend
@@ -299,7 +299,7 @@ void UartNartisRfComponent::retry_or_give_up_(const char *reason) {
   this->rf_giveup_count_++;
   ESP_LOGW(TAG, "RF %s - giving up after %u attempt(s) [no_reply=%" PRIu32 " crc_err=%" PRIu32
                 " retries=%" PRIu32 " giveups=%" PRIu32 "]",
-           reason, (unsigned) this->tx_attempts_, this->rf_no_reply_count_, this->rf_crc_error_count_,
+           LOG_STR_ARG(reason), (unsigned) this->tx_attempts_, this->rf_no_reply_count_, this->rf_crc_error_count_,
            this->rf_retry_count_, this->rf_giveup_count_);
   this->req_len_ = 0;
   this->on_rf_timeout_callback_.call();  // no valid reply delivered this request
@@ -329,7 +329,7 @@ void UartNartisRfComponent::finish_rf_rx_(size_t packet_len) {
     // A corrupt/invalid frame (bad framing or CRC) is a transient RF error -
     // retransmit via ARQ rather than faulting the whole bridge.
     this->rf_crc_error_count_++;
-    this->retry_or_give_up_("bad CRC/framing");
+    this->retry_or_give_up_(LOG_STR("bad CRC/framing"));
     return;
   }
 
@@ -360,8 +360,8 @@ void UartNartisRfComponent::discard_reply_() {
   this->peek_valid_ = false;
 }
 
-void UartNartisRfComponent::enter_fault_(const char *reason) {
-  ESP_LOGE(TAG, "Entering FAULT: %s", reason);
+void UartNartisRfComponent::enter_fault_(const LogString *reason) {
+  ESP_LOGE(TAG, "Entering FAULT: %s", LOG_STR_ARG(reason));
   this->uart_msg_len_ = 0;
   this->req_len_ = 0;
   this->rf_tx_len_ = 0;
@@ -371,26 +371,27 @@ void UartNartisRfComponent::enter_fault_(const char *reason) {
 
 void UartNartisRfComponent::set_state_(BridgeState state) {
   if (this->state_ != state) {
-    ESP_LOGV(TAG, "State: %s -> %s", this->state_to_string_(this->state_), this->state_to_string_(state));
+    ESP_LOGV(TAG, "State: %s -> %s", LOG_STR_ARG(this->state_to_string_(this->state_)),
+             LOG_STR_ARG(this->state_to_string_(state)));
     this->state_ = state;
   }
   this->state_enter_ms_ = millis();
 }
 
-const char *UartNartisRfComponent::state_to_string_(BridgeState state) const {
+const LogString *UartNartisRfComponent::state_to_string_(BridgeState state) const {
   switch (state) {
     case BridgeState::IDLE:
-      return "IDLE";
+      return LOG_STR("IDLE");
     case BridgeState::COLLECT:
-      return "COLLECT";
+      return LOG_STR("COLLECT");
     case BridgeState::TX_RF:
-      return "TX_RF";
+      return LOG_STR("TX_RF");
     case BridgeState::RX_RF:
-      return "RX_RF";
+      return LOG_STR("RX_RF");
     case BridgeState::FAULT:
-      return "FAULT";
+      return LOG_STR("FAULT");
     default:
-      return "UNKNOWN";
+      return LOG_STR("UNKNOWN");
   }
 }
 

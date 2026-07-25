@@ -36,6 +36,7 @@
 #include "esphome/core/component.h"
 #include "esphome/core/helpers.h"
 #include "esphome/core/gpio.h"
+#include "esphome/core/log.h"
 #include "esphome/components/uart/uart_component.h"
 #include "esphome/components/ring_buffer/ring_buffer.h"
 
@@ -135,13 +136,13 @@ class UartNartisRfComponent : public uart::UARTComponent, public Component {
  protected:
   // --- State machine helpers ---
   void set_state_(BridgeState state);
-  const char *state_to_string_(BridgeState state) const;
-  void begin_rf_tx_();                     // latch the collected request and start the first attempt
-  void start_tx_attempt_();                // (re)pack the latched request and transmit it
-  void retry_or_give_up_(const char *reason);  // ARQ: retransmit if attempts remain, else give up
-  void finish_rf_rx_(size_t packet_len);   // unpack a received packet into the reply FIFO
-  void enter_fault_(const char *reason);
-  void discard_reply_();                   // drop any queued reply + peek cache (resync on a new request)
+  const LogString *state_to_string_(BridgeState state) const;
+  void begin_rf_tx_();                              // latch the collected request and start the first attempt
+  void start_tx_attempt_();                         // (re)pack the latched request and transmit it
+  void retry_or_give_up_(const LogString *reason);  // ARQ: retransmit if attempts remain, else give up
+  void finish_rf_rx_(size_t packet_len);            // unpack a received packet into the reply FIFO
+  void enter_fault_(const LogString *reason);
+  void discard_reply_();  // drop any queued reply + peek cache (resync on a new request)
 
   // ==========================================================================
   // RF radio extension points - ALL STUBS.
