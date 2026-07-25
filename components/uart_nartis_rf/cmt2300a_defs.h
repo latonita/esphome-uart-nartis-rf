@@ -128,6 +128,28 @@ static constexpr uint32_t STATE_POLL_INTERVAL_US = 100;
 static constexpr float RX_CODE_HZ = 6.199f;
 
 /* ================================================================
+ * Frequency-bank computation (CMOSTEK AN199).
+ *
+ * Every meter channel (435.5-451.7 MHz; see frequency_from_address_) lies in
+ * the 420-510 MHz PLL band, so the divider / VCO-bank selection AND all modem
+ * banks (incl. AFC_OVF_TH) are constant across channels - only FREQ_RX_N/K and
+ * FREQ_TX_N/K change. Verified byte-for-byte against RFPDK exports at
+ * 435.5 / 439.7 / 443.9 / 447.4 / 451.7 MHz.
+ *
+ *   FREQ_LO_tx = f_rf ;   FREQ_LO_rx = f_rf + XTAL/92 (superhet IF)
+ *   word = floor(FREQ_LO * DIVIDER / XTAL * 2^20) ;  N = word>>20 ;  K = word & 0xFFFFF
+ * Bank layout: 0x18 RX_N | 0x19-0x1A RX_K[15:0] | 0x1B [PALDO|DIVX|RX_K[19:16]]
+ *              0x1C TX_N | 0x1D-0x1E TX_K[15:0] | 0x1F [FSK_SWT|VCO_BANK|TX_K[19:16]]
+ * ================================================================ */
+static constexpr uint32_t XTAL_HZ = 26000000u;
+static constexpr uint32_t FREQ_DIVIDER = 4u;          // 420-510 MHz band
+static constexpr uint32_t FREQ_IF_HZ = XTAL_HZ / 92;  // RX LO offset above RF (282608 Hz)
+static constexpr uint8_t FREQ_VCO_BANK = 0x1;         // <2:0>, 420-510 MHz
+static constexpr uint8_t FREQ_DIVX_CODE = 0x1;        // <2:0>, 420-510 MHz
+static constexpr uint8_t FREQ_PALDO_SEL = 0x0;        // TX < 500 MHz
+static constexpr uint8_t FREQ_FSK_SWT = 0x0;          // RFPDK-fixed bit (0x1F bit7), freq-independent
+
+/* ================================================================
  * d101-2 / 443.9 MHz register banks (RFPDK export, from the proven test app).
  * ================================================================ */
 // clang-format off
@@ -163,7 +185,9 @@ static constexpr uint8_t BASEBAND_BANK[29] = {
 static constexpr uint8_t TX_BANK[11] = {  // +20 dBm (4 kHz dev ramp)
     0x50, 0x85, 0x02, 0x00, 0x86, 0xD0, 0x00, 0x8A, 0x18, 0x3F, 0x7F
 };
-// FREQUENCY bank = [RX-LO 4B][TX 4B]. 443.900 MHz (RFPDK; prefix 0x44 = band OK).
+// FREQUENCY bank = [RX-LO 4B][TX 4B]. Reference value for 443.900 MHz (RFPDK
+// export). The bank is now computed per channel at runtime (see compute_freq_bank_
+// / AN199 above); this constant is the k=12 anchor the formula reproduces exactly.
 static constexpr uint8_t FREQ_443M9[8] = {
     0x44, 0x60, 0x5F, 0x15,  0x44, 0x4A, 0xAD, 0x14
 };

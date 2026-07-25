@@ -31,8 +31,14 @@ class Cmt2300aHal {
                 esphome::InternalGPIOPin *csb, esphome::InternalGPIOPin *fcsb,
                 esphome::InternalGPIOPin *gpio3);
 
-  /// Base init: soft reset, write the 6 register banks (443.9 / narrow-TX resting
-  /// profile) and the common post-config patches. Returns true on success.
+  /// Set the RF channel frequency (Hz) and (re)compute the 8-byte frequency bank
+  /// via the AN199 formula. Call before init() (init() writes the computed bank).
+  /// Defaults to 443.9 MHz if never called.
+  void set_frequency(uint32_t freq_hz);
+
+  /// Base init: soft reset, write the 6 register banks (computed frequency +
+  /// narrow-TX resting profile) and the common post-config patches. Returns true
+  /// on success.
   bool init();
 
   /// Read product ID (0x66 for CMT2300A) - wiring/comms sanity check.
@@ -44,7 +50,7 @@ class Cmt2300aHal {
   /// chip in standby afterwards.
   bool transmit(const uint8_t *frame, size_t len);
 
-  /// Enter RX centred at (443.905 + off_codes * 6.199 Hz): applies the wide RX
+  /// Enter RX centred at (rf_freq_hz_ + off_codes * 6.199 Hz): applies the wide RX
   /// profile + 2-byte sync + chip bit-order, then RFS -> RX. Returns true if RX
   /// was entered.
   bool begin_rx(int off_codes);
@@ -92,6 +98,7 @@ class Cmt2300aHal {
   void init_tx();               // narrow TX profile, sync blended to 0x55, FIFO -> TX
   void init_rx(int off_codes);  // wide RX profile, sync 19 CF, chip bit-order, FIFO -> RX
   void set_rx_center(int off_codes);  // shift the RX-half LO by off_codes (TX-half untouched)
+  void compute_freq_bank_();          // fill freq_bank_ from rf_freq_hz_ (AN199)
 
   esphome::InternalGPIOPin *sdio_pin_{nullptr};
   esphome::InternalGPIOPin *sclk_pin_{nullptr};
@@ -105,6 +112,10 @@ class Cmt2300aHal {
   esphome::ISRInternalGPIOPin gpio3_;
 
   bool initialized_{false};
+
+  // Per-channel frequency: rf_freq_hz_ -> freq_bank_ (8 bytes: [RX-LO 4B][TX-LO 4B]).
+  uint32_t rf_freq_hz_{443900000};
+  uint8_t freq_bank_[FREQUENCY_BANK_SIZE]{};
 };
 
 }  // namespace esphome::uart_nartis_rf

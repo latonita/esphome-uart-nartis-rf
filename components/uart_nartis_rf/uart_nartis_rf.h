@@ -99,8 +99,8 @@ class UartNartisRfComponent : public uart::UARTComponent, public Component {
   void set_pin_fcsb(esphome::InternalGPIOPin *p) { this->pin_fcsb_ = p; }
   void set_pin_gpio3(esphome::InternalGPIOPin *p) { this->pin_gpio3_ = p; }
 
-  /// Meter serial / RF address (digits only, e.g. "023240271060"). Goes into the
-  /// RF packet (TODO) and selects the channel via its last 3 digits.
+  /// Meter serial / RF address (digits only, e.g. "023240271060"). Used as the BCD
+  /// serial in the RF envelope and selects the channel frequency via its last 3 digits.
   void set_address(const std::string &address) { this->address_ = address; }
 
   // --- Automation callbacks (templatized to accept lightweight forwarders) ---

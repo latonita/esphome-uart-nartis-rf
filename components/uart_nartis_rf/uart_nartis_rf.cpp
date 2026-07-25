@@ -38,7 +38,7 @@ void UartNartisRfComponent::dump_config() {
                   this->pin_fcsb_->get_pin(), this->pin_gpio3_->get_pin());
   }
   ESP_LOGCONFIG(TAG, "  Address (meter serial): %s", this->address_.c_str());
-  ESP_LOGCONFIG(TAG, "  RF frequency: 443.900 MHz (fixed; serial-derived %.3f MHz not yet applied)",
+  ESP_LOGCONFIG(TAG, "  RF frequency: %.3f MHz (channel derived from meter serial)",
                 this->frequency_from_address_() / 1e6f);
   ESP_LOGCONFIG(TAG, "  RX center offset: %d codes (~%+.1f kHz)", this->rx_center_offset_,
                 this->rx_center_offset_ * RX_CODE_HZ / 1000.0f);
@@ -69,7 +69,7 @@ void UartNartisRfComponent::loop() {
       // has been quiet for request_gap_ms_.
       if (this->uart_msg_len_ > 0 &&
           (this->force_send_ || (now - this->last_write_ms_) >= this->request_gap_ms_)) {
-        ESP_LOGD(TAG, "Request complete (%zu bytes)%s", this->uart_msg_len_,
+        ESP_LOGV(TAG, "Request complete (%zu bytes)%s", this->uart_msg_len_,
                  LOG_STR_ARG(this->force_send_ ? LOG_STR(" [flush]") : LOG_STR("")));
         this->force_send_ = false;
         this->on_uart_message_callback_.call();
@@ -100,7 +100,7 @@ void UartNartisRfComponent::loop() {
       size_t packet_len = 0;
       const RfStatus st = this->rf_poll_receive_(this->rf_rx_buf_.data(), this->rf_rx_buf_.size(), &packet_len);
       if (st == RfStatus::OK) {
-        ESP_LOGD(TAG, "RF reply received (%zu bytes)", packet_len);
+        ESP_LOGV(TAG, "RF reply received (%zu bytes)", packet_len);
         this->finish_rf_rx_(packet_len);
       } else if (st == RfStatus::NO_DATA || st == RfStatus::BUSY) {
         if ((now - this->state_enter_ms_) >= this->rf_rx_timeout_ms_) {
@@ -335,7 +335,7 @@ void UartNartisRfComponent::finish_rf_rx_(size_t packet_len) {
 
   // Success: the latched request is done.
   this->req_len_ = 0;
-  ESP_LOGW(TAG, "RF RX HDLC [%zu]: %s", unpacked_len,
+  ESP_LOGVV(TAG, "RF RX HDLC [%zu]: %s", unpacked_len,
            format_hex_pretty(this->unpack_buf_.data(), unpacked_len).c_str());
 
   if (unpacked_len > 0 && this->rx_buffer_ != nullptr) {
@@ -344,7 +344,7 @@ void UartNartisRfComponent::finish_rf_rx_(size_t packet_len) {
       ESP_LOGW(TAG, "Reply FIFO overflow, dropped %zu bytes (upstream not reading?)",
                unpacked_len - written);
     }
-    ESP_LOGD(TAG, "Queued %zu reply byte(s) for upstream", written);
+    ESP_LOGV(TAG, "Queued %zu reply byte(s) for upstream", written);
   }
   this->on_rf_reply_callback_.call();
   this->rf_set_idle_();
@@ -475,19 +475,21 @@ RfStatus UartNartisRfComponent::rf_init_() {
 
   this->hal_.set_pins(this->pin_sdio_, this->pin_sclk_, this->pin_csb_, this->pin_fcsb_, this->pin_gpio3_);
 
+  this->derive_serial_le_();
+
+  // Channel frequency is derived from the meter serial (last 3 digits) and applied
+  // to the CMT2300A frequency bank (AN199 formula in the HAL). Must be set before
+  // init(), which writes the computed bank.
+  this->rf_frequency_hz_ = this->frequency_from_address_();
+  this->hal_.set_frequency(this->rf_frequency_hz_);
+
   if (!this->hal_.init()) {
     ESP_LOGE(TAG, "rf_init_: CMT2300A initialization failed - check wiring");
     return RfStatus::ERROR;
   }
 
-  this->derive_serial_le_();
-
-  // NOTE: frequency is FIXED at 443.9 MHz for now. The serial-derived frequency
-  // (frequency_from_address_) is computed for logging but not yet applied - the
-  // register encoding for arbitrary channels is TODO.
-  this->rf_frequency_hz_ = this->frequency_from_address_();
-  ESP_LOGI(TAG, "rf_init_: CMT2300A ready at 443.9 MHz (address=%s; serial-derived freq %.3f MHz not yet applied)",
-           this->address_.c_str(), this->rf_frequency_hz_ / 1e6f);
+  ESP_LOGI(TAG, "rf_init_: CMT2300A ready at %.3f MHz (channel derived from address %s)",
+           this->rf_frequency_hz_ / 1e6f, this->address_.c_str());
   return RfStatus::OK;
 }
 
@@ -546,7 +548,7 @@ RfStatus UartNartisRfComponent::rf_pack_(const uint8_t *payload, size_t payload_
   out[p++] = (uint8_t) ((crc >> 8) & 0xFF);
 
   *out_len = p;
-  ESP_LOGV(TAG, "rf_pack_: %zu hdlc -> %zu on-air bytes (OLEN=%u HLEN=%u)", payload_len, p, (unsigned) olen,
+  ESP_LOGVV(TAG, "rf_pack_: %zu hdlc -> %zu on-air bytes (OLEN=%u HLEN=%u)", payload_len, p, (unsigned) olen,
            (unsigned) hlen);
   return RfStatus::OK;
 }
@@ -605,7 +607,7 @@ RfStatus UartNartisRfComponent::rf_start_transmit_(const uint8_t *packet, size_t
   // hal_.transmit() is synchronous: applies the TX profile, pads + bit-reverses,
   // fills the FIFO, GO_TX, and blocks until TX_DONE (or ~600 ms). It blocks the
   // loop only for the frame's airtime (~tens of ms at 1.2 kbps).
-  ESP_LOGW(TAG, "RF TX [%zu]: %s", len, format_hex_pretty(packet, len).c_str());
+  ESP_LOGVV(TAG, "RF TX [%zu]: %s", len, format_hex_pretty(packet, len).c_str());
   if (!this->hal_.transmit(packet, len)) {
     ESP_LOGW(TAG, "rf_start_transmit_: TX did not complete");
     return RfStatus::ERROR;
@@ -626,7 +628,7 @@ RfStatus UartNartisRfComponent::rf_enter_rx_mode_() {
   }
   this->rf_rx_accum_len_ = 0;
   this->rf_rx_last_chunk_ms_ = millis();
-  ESP_LOGV(TAG, "rf_enter_rx_mode_: RX armed (center offset %d codes)", this->rx_center_offset_);
+  ESP_LOGVV(TAG, "rf_enter_rx_mode_: RX armed (center offset %d codes)", this->rx_center_offset_);
   return RfStatus::OK;
 }
 
@@ -674,7 +676,7 @@ RfStatus UartNartisRfComponent::rf_poll_receive_(uint8_t *out, size_t out_cap, s
 RfStatus UartNartisRfComponent::rf_set_idle_() {
   this->rf_rx_accum_len_ = 0;
   this->hal_.go_standby();
-  ESP_LOGV(TAG, "rf_set_idle_: standby");
+  ESP_LOGVV(TAG, "rf_set_idle_: standby");
   return RfStatus::OK;
 }
 

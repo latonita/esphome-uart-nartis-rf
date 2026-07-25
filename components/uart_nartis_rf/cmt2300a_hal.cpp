@@ -177,9 +177,10 @@ bool Cmt2300aHal::init() {
   }
 
   // Register banks (freq + narrow ~4 kHz data-rate = resting/TX profile).
+  this->compute_freq_bank_();  // ensure freq_bank_ reflects rf_freq_hz_ (default 443.9)
   this->write_bank(CMT_BANK_ADDR, CMT_BANK, CMT_BANK_SIZE);
   this->write_bank(SYSTEM_BANK_ADDR, SYSTEM_BANK, SYSTEM_BANK_SIZE);
-  this->write_bank(FREQUENCY_BANK_ADDR, FREQ_443M9, FREQUENCY_BANK_SIZE);
+  this->write_bank(FREQUENCY_BANK_ADDR, this->freq_bank_, FREQUENCY_BANK_SIZE);
   this->write_bank(DATA_RATE_BANK_ADDR, DATA_RATE_TX_BANK, DATA_RATE_BANK_SIZE);
   this->write_bank(BASEBAND_BANK_ADDR, BASEBAND_BANK, BASEBAND_BANK_SIZE);
   this->write_bank(TX_BANK_ADDR, TX_BANK, TX_BANK_SIZE);
@@ -195,8 +196,36 @@ bool Cmt2300aHal::init() {
   this->update_reg(REG_INT2_CTL, MASK_INT_POLAR, 0x00);                   // INT2 active-high
 
   this->initialized_ = true;
-  ESP_LOGI(TAG, "CMT2300A initialized (443.9 MHz, d101-2 profile)");
+  ESP_LOGI(TAG, "CMT2300A initialized (%.3f MHz)", this->rf_freq_hz_ / 1e6f);
   return true;
+}
+
+// Compute the 8-byte frequency bank for rf_freq_hz_ per CMOSTEK AN199 (see
+// cmt2300a_defs.h). TX LO = f_rf; RX LO = f_rf + IF. Matches RFPDK byte-for-byte.
+void Cmt2300aHal::compute_freq_bank_() {
+  auto word = [](uint32_t lo_hz) -> uint32_t {
+    // word = floor(FREQ_LO * DIVIDER / XTAL * 2^20); N = word>>20, K = low 20 bits.
+    return (uint32_t) ((((uint64_t) lo_hz * FREQ_DIVIDER) << 20) / XTAL_HZ);
+  };
+  const uint32_t w_tx = word(this->rf_freq_hz_);
+  const uint32_t w_rx = word(this->rf_freq_hz_ + FREQ_IF_HZ);
+  const uint8_t n_tx = (uint8_t) (w_tx >> 20);
+  const uint32_t k_tx = w_tx & 0xFFFFF;
+  const uint8_t n_rx = (uint8_t) (w_rx >> 20);
+  const uint32_t k_rx = w_rx & 0xFFFFF;
+  this->freq_bank_[0] = n_rx;                                                            // 0x18 FREQ_RX_N
+  this->freq_bank_[1] = k_rx & 0xFF;                                                     // 0x19 FREQ_RX_K[7:0]
+  this->freq_bank_[2] = (k_rx >> 8) & 0xFF;                                              // 0x1A FREQ_RX_K[15:8]
+  this->freq_bank_[3] = (FREQ_PALDO_SEL << 7) | (FREQ_DIVX_CODE << 4) | ((k_rx >> 16) & 0x0F);  // 0x1B
+  this->freq_bank_[4] = n_tx;                                                            // 0x1C FREQ_TX_N
+  this->freq_bank_[5] = k_tx & 0xFF;                                                     // 0x1D FREQ_TX_K[7:0]
+  this->freq_bank_[6] = (k_tx >> 8) & 0xFF;                                              // 0x1E FREQ_TX_K[15:8]
+  this->freq_bank_[7] = (FREQ_FSK_SWT << 7) | (FREQ_VCO_BANK << 4) | ((k_tx >> 16) & 0x0F);  // 0x1F
+}
+
+void Cmt2300aHal::set_frequency(uint32_t freq_hz) {
+  this->rf_freq_hz_ = freq_hz;
+  this->compute_freq_bank_();
 }
 
 bool Cmt2300aHal::is_chip_connected() {
@@ -242,12 +271,14 @@ void Cmt2300aHal::init_rx(int off_codes) {
   this->set_rx_center(off_codes);
 }
 
-// RX-half LO = base 443.9 RX code + off_codes. RX uses only the RX-half
-// (0x18-0x1B); the TX-half (0x1C-0x1F) is left untouched.
+// RX-half LO = computed RX code (this channel) + off_codes. RX uses only the
+// RX-half (0x18-0x1B); the TX-half (0x1C-0x1F) is left untouched. off_codes is
+// small, so it only nudges FREQ_RX_K without disturbing the band bits in 0x1B.
 void Cmt2300aHal::set_rx_center(int off_codes) {
-  uint32_t base = (uint32_t) FREQ_443M9[1] | ((uint32_t) FREQ_443M9[2] << 8) | ((uint32_t) FREQ_443M9[3] << 16);
+  uint32_t base = (uint32_t) this->freq_bank_[1] | ((uint32_t) this->freq_bank_[2] << 8) |
+                  ((uint32_t) this->freq_bank_[3] << 16);
   uint32_t code = (uint32_t) ((int32_t) base + off_codes);
-  this->spi_write_reg(FREQUENCY_BANK_ADDR + 0, FREQ_443M9[0]);
+  this->spi_write_reg(FREQUENCY_BANK_ADDR + 0, this->freq_bank_[0]);
   this->spi_write_reg(FREQUENCY_BANK_ADDR + 1, code & 0xFF);
   this->spi_write_reg(FREQUENCY_BANK_ADDR + 2, (code >> 8) & 0xFF);
   this->spi_write_reg(FREQUENCY_BANK_ADDR + 3, (code >> 16) & 0xFF);
@@ -299,7 +330,7 @@ bool Cmt2300aHal::transmit(const uint8_t *frame, size_t len) {
       // For a chunked (>FIFO) frame, log timing + fill so we can tell a clean send
       // (dur ~ airtime, written==tot) from a FIFO underrun (dur too short).
       if (chunked)
-        ESP_LOGW(TAG, "TX done (chunked): %zu/%zu written, %" PRIu32 " ms", written, tot, dur);
+        ESP_LOGVV(TAG, "TX done (chunked): %zu/%zu written, %" PRIu32 " ms", written, tot, dur);
       return true;
     }
     // Refill when the TX FIFO has drained to/below threshold (FIFO_TX_TH == 0).
@@ -312,7 +343,7 @@ bool Cmt2300aHal::transmit(const uint8_t *frame, size_t len) {
     esphome::delayMicroseconds(50);
     esphome::yield();
   }
-  ESP_LOGW(TAG, "TX_DONE timeout (%zu/%zu written, MODE_STA=0x%02X FIFO_FLAG=0x%02X)", written, tot,
+  ESP_LOGV(TAG, "TX_DONE timeout (%zu/%zu written, MODE_STA=0x%02X FIFO_FLAG=0x%02X)", written, tot,
            this->spi_read_reg(REG_MODE_STA), this->spi_read_reg(REG_FIFO_FLAG));
   this->go_standby();
   return false;

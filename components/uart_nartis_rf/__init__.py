@@ -10,8 +10,8 @@ read side of the virtual UART.
 
 The CMT2300A radio driver (bit-bang SPI HAL), the type-5A DLMS-HDLC envelope
 (build on TX, CRC-carve + unwrap on RX), link-layer ARQ, and the non-blocking
-bridge state machine are all implemented. The frequency is fixed at 443.9 MHz for
-now (serial-derived selection is a TODO).
+bridge state machine are all implemented. The operating frequency is derived from
+the meter serial (last 3 digits) and programmed into the CMT2300A per channel.
 """
 
 from esphome import pins
