@@ -47,8 +47,9 @@ void UartNartisRfComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "  RF RX timeout: %" PRIu32 " ms", this->rf_rx_timeout_ms_);
   ESP_LOGCONFIG(TAG, "  RF retries: %u (up to %u attempts per request)", this->rf_retries_,
                 (unsigned) (this->rf_retries_ + 1));
-  ESP_LOGCONFIG(TAG, "  RF: d101-2 PHY + type-5A envelope (CRC-16/X.25) live; TX wraps HDLC, "
-                     "RX carves + extracts inner 7E..7E HDLC.");
+  ESP_LOGCONFIG(TAG, "  Max payload: %zu bytes out, %zu bytes in", MAX_RF_PAYLOAD_SIZE, MAX_RF_RX_PAYLOAD_SIZE);
+  ESP_LOGCONFIG(TAG, "  RF: RF433-2 PHY + envelope (CRC-16/X.25). Payload is relayed verbatim - "
+                     "the bridge adds/strips the envelope only.");
 }
 
 void UartNartisRfComponent::loop() {
@@ -102,10 +103,20 @@ void UartNartisRfComponent::loop() {
       if (st == RfStatus::OK) {
         ESP_LOGV(TAG, "RF reply received (%zu bytes)", packet_len);
         this->finish_rf_rx_(packet_len);
-      } else if (st == RfStatus::NO_DATA || st == RfStatus::BUSY) {
+      } else if (st == RfStatus::NO_DATA) {
+        // Nothing has arrived at all - this is what rf_rx_timeout_ms_ bounds.
         if ((now - this->state_enter_ms_) >= this->rf_rx_timeout_ms_) {
           this->rf_no_reply_count_++;
           this->retry_or_give_up_(LOG_STR("no reply"));
+        }
+      } else if (st == RfStatus::BUSY) {
+        // A frame IS arriving. rf_rx_timeout_ms_ must not apply here: a full-size
+        // envelope is ~1.7 s of airtime at 1.2 kbps, so a 1 s reply timeout would
+        // chop every long reply. rf_poll_receive_ ends a stalled frame via
+        // RF_RX_END_GAP_MS; this is only the absolute backstop.
+        if ((now - this->state_enter_ms_) >= RF_RX_MAX_WINDOW_MS) {
+          this->rf_no_reply_count_++;
+          this->retry_or_give_up_(LOG_STR("RX window exceeded mid-frame"));
         }
       } else {
         this->enter_fault_(LOG_STR("RF RX error"));
@@ -192,6 +203,13 @@ bool UartNartisRfComponent::read_array(uint8_t *data, size_t len) {
   if (data == nullptr || len == 0) {
     return true;
   }
+  // All-or-nothing: check first, consume second. Consuming the peek cache before
+  // discovering the FIFO is short would drop that byte on the floor - the caller
+  // sees `false`, assumes nothing was read, and the byte is gone from the stream.
+  if (this->available() < len) {
+    return false;
+  }
+
   size_t remaining = len;
   size_t offset = 0;
 
@@ -204,11 +222,6 @@ bool UartNartisRfComponent::read_array(uint8_t *data, size_t len) {
   }
   if (remaining == 0) {
     return true;
-  }
-  if (this->rx_buffer_ == nullptr || this->rx_buffer_->available() < remaining) {
-    // Not enough data. The peeked byte (if any) has already been consumed into
-    // data[0]; the UARTComponent contract lets callers gate on available() first.
-    return false;
   }
   return this->rx_buffer_->read(data + offset, remaining, 0) == remaining;
 }
@@ -233,33 +246,32 @@ uart::UARTFlushResult UartNartisRfComponent::flush() {
 // ============================================================================
 
 void UartNartisRfComponent::begin_rf_tx_() {
-  // Latch the collected request so it survives across retransmissions, and free
-  // uart_msg_buf_ to collect the upstream's next request while this is in flight.
+  // Pack ONCE into rf_tx_buf_: that packed frame is what every attempt resends, so
+  // uart_msg_buf_ is immediately free to collect the upstream's next request while
+  // this one is in flight.
   this->req_len_ = this->uart_msg_len_;
-  std::memcpy(this->req_buf_.data(), this->uart_msg_buf_.data(), this->req_len_);
+  this->rf_tx_len_ = 0;
+  const RfStatus st = this->rf_pack_(this->uart_msg_buf_.data(), this->req_len_, this->rf_tx_buf_.data(),
+                                     this->rf_tx_buf_.size(), &this->rf_tx_len_);
   this->uart_msg_len_ = 0;
   this->tx_attempts_ = 0;
   this->req_abandoned_ = false;  // fresh request: not (yet) superseded by a newer one
-  this->start_tx_attempt_();
-}
-
-void UartNartisRfComponent::start_tx_attempt_() {
-  // Re-pack the latched request on every attempt (NOT resend the same bytes):
-  // when rf_pack_ carries a frame counter / GCM nonce, each attempt must be a
-  // fresh valid frame or the meter rejects the retransmission as a replay.
-  this->rf_tx_len_ = 0;
-  RfStatus st = this->rf_pack_(this->req_buf_.data(), this->req_len_, this->rf_tx_buf_.data(),
-                               this->rf_tx_buf_.size(), &this->rf_tx_len_);
   if (st != RfStatus::OK) {
     // Packing is deterministic - retrying won't help, so fail safe.
     this->enter_fault_(LOG_STR("RF packing failed"));
     return;
   }
+  this->start_tx_attempt_();
+}
 
+void UartNartisRfComponent::start_tx_attempt_() {
+  // Resend the frame packed by begin_rf_tx_(). A transparent retransmit is
+  // byte-identical: the envelope carries no frame counter or nonce, so there is
+  // nothing to regenerate per attempt.
   // Count the attempt BEFORE transmitting so a persistent transmit-start
   // failure still advances toward give-up instead of looping forever.
   this->tx_attempts_++;
-  st = this->rf_start_transmit_(this->rf_tx_buf_.data(), this->rf_tx_len_);
+  const RfStatus st = this->rf_start_transmit_(this->rf_tx_buf_.data(), this->rf_tx_len_);
   if (st != RfStatus::OK) {
     // Couldn't even start the transmit: treat as a failed attempt so ARQ can
     // retry (the radio may have been momentarily busy).
@@ -283,16 +295,15 @@ void UartNartisRfComponent::retry_or_give_up_(const LogString *reason) {
   // ARQ: one send plus rf_retries_ retransmissions. tx_attempts_ counts sends
   // already made (>=1 here), so retry while tx_attempts_ <= rf_retries_.
   //
-  // NOTE (idempotency): we retransmit on both no-reply AND bad-CRC-reply. A
-  // bad-CRC reply means the meter likely received and acted on the request, so
-  // resending re-executes it. That is safe for reads (GET) but NOT for writes
-  // (SET/ACTION). This bridge targets meter reads; revisit if writes are added.
+  // This is a blind link-layer retransmit: the transport cannot tell a repeatable
+  // request from one with side effects, because it never parses the payload. Set
+  // rf_retries: 0 to leave all retrying to the upstream, which does know.
   if (this->tx_attempts_ <= this->rf_retries_) {
     this->rf_retry_count_++;
     ESP_LOGW(TAG, "RF %s - retransmit (attempt %u/%u)", LOG_STR_ARG(reason),
              (unsigned) (this->tx_attempts_ + 1), (unsigned) (this->rf_retries_ + 1));
     this->rf_set_idle_();
-    this->start_tx_attempt_();  // re-pack (fresh frame) + resend
+    this->start_tx_attempt_();  // resend the same packed frame
     return;
   }
 
@@ -319,7 +330,7 @@ void UartNartisRfComponent::finish_rf_rx_(size_t packet_len) {
     return;
   }
 
-  ESP_LOGW(TAG, "RF RX raw [%zu]: %s", packet_len,
+  ESP_LOGVV(TAG, "RF RX raw [%zu]: %s", packet_len,
            format_hex_pretty(this->rf_rx_buf_.data(), packet_len).c_str());
 
   size_t unpacked_len = 0;
@@ -335,7 +346,7 @@ void UartNartisRfComponent::finish_rf_rx_(size_t packet_len) {
 
   // Success: the latched request is done.
   this->req_len_ = 0;
-  ESP_LOGVV(TAG, "RF RX HDLC [%zu]: %s", unpacked_len,
+  ESP_LOGVV(TAG, "RF RX payload [%zu]: %s", unpacked_len,
            format_hex_pretty(this->unpack_buf_.data(), unpacked_len).c_str());
 
   if (unpacked_len > 0 && this->rx_buffer_ != nullptr) {
@@ -362,11 +373,22 @@ void UartNartisRfComponent::discard_reply_() {
 
 void UartNartisRfComponent::enter_fault_(const LogString *reason) {
   ESP_LOGE(TAG, "Entering FAULT: %s", LOG_STR_ARG(reason));
+  if (this->uart_msg_len_ > 0) {
+    // Say so rather than swallowing it: the upstream already handed these bytes
+    // over, so a silent drop looks like a black hole instead of a failed request.
+    ESP_LOGW(TAG, "FAULT discards %zu byte(s) of a pending request", this->uart_msg_len_);
+  }
+  const bool had_request = this->uart_msg_len_ > 0 || this->req_len_ > 0;
   this->uart_msg_len_ = 0;
   this->req_len_ = 0;
   this->rf_tx_len_ = 0;
   this->force_send_ = false;
   this->set_state_(BridgeState::FAULT);
+  // A fault means no reply will ever be delivered for this request - give
+  // automations the same signal they get from an exhausted-retry give-up.
+  if (had_request) {
+    this->on_rf_timeout_callback_.call();
+  }
 }
 
 void UartNartisRfComponent::set_state_(BridgeState state) {
@@ -440,14 +462,15 @@ uint32_t UartNartisRfComponent::frequency_from_address_() const {
 // RF radio layer - CMT2300A PHY.
 //
 // PHY: 443.9 MHz, asymmetric channel (narrow TX / wide RX), 98 f3 sync, LSB-first
-// on air, CRC-16/X.25. Framing is a two-level scheme (asymmetric envelope):
-//   TX (client->server): 98 F3 | OLEN | 00 01 | HLEN | 5A | serial | hdlc | A5 | CRC
-//   RX (server->client): 98 F3 | OLEN | 00 01 | HLEN | hdlc | CRC   (no 5A/serial/A5)
+// on air, CRC-16/X.25. Framing is an asymmetric envelope:
+//   TX (client->server): 98 F3 | OLEN | 00 01 | HLEN | TYPE | serial | payload | A5 | CRC
+//   RX (server->client): 98 F3 | OLEN | 00 01 | HLEN | payload | CRC  (no TYPE/serial/A5)
 // rf_pack_ builds the request envelope; rf_unpack_ CRC-carves the reply and strips
-// the OLEN|00 01|HLEN header to hand the inner HDLC frame back to the upstream.
+// the fixed OLEN|00 01|HLEN header to hand the payload back to the upstream.
+// Both directions treat the payload as opaque bytes.
 // ============================================================================
 
-// CRC-16/X.25 (poly 0x1021, init/xorout 0xFFFF, reflected in/out) - the d101-2
+// CRC-16/X.25 (poly 0x1021, init/xorout 0xFFFF, reflected in/out) - the RF433-2
 // frame CRC. Ported from the test app.
 static uint16_t crc16_x25(const uint8_t *d, size_t n) {
   uint16_t c = 0xFFFF;
@@ -463,8 +486,14 @@ static uint16_t crc16_x25(const uint8_t *d, size_t n) {
   return r ^ 0xFFFF;
 }
 
-static constexpr uint8_t D101_SYNC0 = 0x98;
-static constexpr uint8_t D101_SYNC1 = 0xF3;
+static constexpr uint8_t RF433_2_SYNC0 = 0x98;
+static constexpr uint8_t RF433_2_SYNC1 = 0xF3;
+/// Frame-type byte of a client->server request. A fixed field of the RF433-2
+/// envelope, like the sync words and the 0xA5 terminator - it describes the
+/// transport, not the payload, so it is a constant and not a config option.
+static constexpr uint8_t RF433_2_TYPE_REQUEST = 0x5A;
+/// Terminator: the meter ignores request frames without it.
+static constexpr uint8_t RF433_2_TERMINATOR = 0xA5;
 
 RfStatus UartNartisRfComponent::rf_init_() {
   if (this->pin_sdio_ == nullptr || this->pin_sclk_ == nullptr || this->pin_csb_ == nullptr ||
@@ -510,45 +539,53 @@ void UartNartisRfComponent::derive_serial_le_() {
 
 RfStatus UartNartisRfComponent::rf_pack_(const uint8_t *payload, size_t payload_len, uint8_t *out, size_t out_cap,
                                          size_t *out_len) {
-  // Wrap the DLMS-HDLC frame (a complete 7E..7E frame from the upstream) in the
-  // d101-2 RF envelope (request direction, type-5A):
-  //   98 F3 | OLEN | 00 01 | HLEN | 5A | serial(6) | <hdlc> | A5 | CRC16(LE)
-  //   OLEN = len(00 01 | HLEN | 5A | serial | hdlc | A5)   (all bytes after OLEN, excl. CRC)
-  //   HLEN = OLEN - 1   (inner DLMS-HDLC block incl. its 2 CRC bytes)
+  // Wrap the upstream's bytes, whatever they are, in the RF433-2 RF envelope
+  // (request direction):
+  //   98 F3 | OLEN | 00 01 | HLEN | TYPE | serial(6) | <payload> | A5 | CRC16(LE)
+  //   OLEN = len(00 01 | HLEN | TYPE | serial | payload | A5)  (after OLEN, excl. CRC)
+  //   HLEN = OLEN - 1   (bytes following HLEN, counting the 2 envelope CRC bytes)
   //   CRC  = CRC-16/X.25 over [OLEN .. A5], little-endian
-  // The 0xA5 terminator is REQUIRED (meter ignores type-5A frames without it).
+  // The 0xA5 terminator is REQUIRED (the meter ignores frames without it).
   // The HAL adds the 0x55 pad and the LSB-first bit-reversal.
+  // TYPE and the terminator are fixed RF433-2 envelope fields (see the constants
+  // above). `payload` is copied verbatim - never parsed, and its length is taken
+  // from the caller, never derived from its contents.
   if (payload == nullptr || out == nullptr || out_len == nullptr) {
     return RfStatus::ERROR;
   }
-  const size_t olen = 2 + 1 + 1 + 6 + payload_len + 1;  // 00 01 + HLEN + 5A + serial(6) + hdlc + A5
+  const size_t olen = 2 + 1 + 1 + 6 + payload_len + 1;  // 00 01 + HLEN + TYPE + serial(6) + payload + A5
   const size_t hlen = olen - 1;
   const size_t total = 2 + 1 + olen + 2;  // sync(2) + OLEN(1) + content(olen) + CRC(2)
+  if (payload_len > MAX_RF_PAYLOAD_SIZE) {
+    ESP_LOGW(TAG, "rf_pack_: request of %zu bytes exceeds the %zu-byte on-air limit (8-bit length field)", payload_len,
+             MAX_RF_PAYLOAD_SIZE);
+    return RfStatus::ERROR;
+  }
   if (olen > 0xFF || total > out_cap) {
     ESP_LOGW(TAG, "rf_pack_: frame (%zu) exceeds buffer (%zu) or OLEN>255", total, out_cap);
     return RfStatus::ERROR;
   }
 
   size_t p = 0;
-  out[p++] = D101_SYNC0;
-  out[p++] = D101_SYNC1;
+  out[p++] = RF433_2_SYNC0;
+  out[p++] = RF433_2_SYNC1;
   out[p++] = (uint8_t) olen;  // OLEN
   out[p++] = 0x00;
   out[p++] = 0x01;
   out[p++] = (uint8_t) hlen;  // HLEN = OLEN - 1
-  out[p++] = 0x5A;  // type-5A (DLMS-HDLC, request)
+  out[p++] = RF433_2_TYPE_REQUEST;
   for (size_t i = 0; i < 6; i++)
     out[p++] = this->serial_le_[i];
   std::memcpy(out + p, payload, payload_len);
   p += payload_len;
-  out[p++] = 0xA5;  // REQUIRED transport terminator
+  out[p++] = RF433_2_TERMINATOR;
 
   const uint16_t crc = crc16_x25(out + 2, olen + 1);  // OLEN byte + content
   out[p++] = (uint8_t) (crc & 0xFF);
   out[p++] = (uint8_t) ((crc >> 8) & 0xFF);
 
   *out_len = p;
-  ESP_LOGVV(TAG, "rf_pack_: %zu hdlc -> %zu on-air bytes (OLEN=%u HLEN=%u)", payload_len, p, (unsigned) olen,
+  ESP_LOGVV(TAG, "rf_pack_: %zu payload -> %zu on-air bytes (OLEN=%u HLEN=%u)", payload_len, p, (unsigned) olen,
            (unsigned) hlen);
   return RfStatus::OK;
 }
@@ -558,12 +595,17 @@ RfStatus UartNartisRfComponent::rf_unpack_(const uint8_t *packet, size_t packet_
   // The chip strips 98 f3, so `packet` starts at the OLEN byte and runs into
   // trailing noise (fixed-length capture). Carve the frame by length + CRC:
   //   OLEN = packet[lp]; CRC-16/X.25 over packet[lp .. lp+OLEN] == next 2 (LE).
-  // Scan a few start positions for robustness. Then extract the inner HDLC frame
-  // (first 0x7E .. last 0x7E) - the reply envelope carries no 5A/serial header,
-  // so we locate the HDLC directly rather than assuming the request layout.
+  // Scan a few start positions for robustness.
+  //
+  // The reply envelope (server->client) is OLEN | 00 01 | HLEN | <payload>, with no
+  // type/serial/terminator. We validate only OUR OWN fields (CRC, the 00 01 marker,
+  // HLEN's self-consistency), then strip the fixed 4-byte header unconditionally and
+  // hand back the payload verbatim. The payload is opaque: it is NOT inspected, and
+  // how many bytes we strip must never depend on what is inside it.
   if (packet == nullptr || out == nullptr || out_len == nullptr) {
     return RfStatus::ERROR;
   }
+  static constexpr size_t RX_HEADER_LEN = 4;  // OLEN + 00 01 + HLEN
   for (size_t lp = 0; lp <= 3; lp++) {
     if (lp >= packet_len)
       break;
@@ -575,28 +617,34 @@ RfStatus UartNartisRfComponent::rf_unpack_(const uint8_t *packet, size_t packet_
     if (calc != got)
       continue;
 
-    // CRC-OK. The reply envelope (server->client) is OLEN | 00 01 | HLEN | <hdlc>,
-    // with no 5A/serial/A5. Strip the 4-byte transport header (OLEN + 00 01 +
-    // HLEN); the remainder of the body is the inner HDLC frame (7E..7E).
+    // CRC-OK: this is our frame. body spans OLEN..end-of-content (CRC excluded).
     const uint8_t *body = packet + lp;
     const size_t body_len = olen + 1;
-    if (body_len >= 6 && body[4] == 0x7E && body[body_len - 1] == 0x7E) {
-      const uint8_t *hdlc = body + 4;
-      const size_t hdlc_len = body_len - 4;
-      if (hdlc_len > out_cap)
-        return RfStatus::ERROR;
-      std::memcpy(out, hdlc, hdlc_len);
-      *out_len = hdlc_len;
-      ESP_LOGI(TAG, "rf_unpack_: CRC-OK, %zu-byte HDLC (body %zu, start %zu)", hdlc_len, body_len, lp);
-      return RfStatus::OK;
-    }
-    // CRC-OK but not the expected OLEN|00 01|HLEN|7E..7E layout - hand back the
-    // whole body so the upstream can decide (shouldn't happen for a DLMS reply).
-    if (body_len > out_cap)
+    if (body_len < RX_HEADER_LEN) {
+      ESP_LOGW(TAG, "rf_unpack_: CRC-OK but body too short for the envelope header (%zu bytes)", body_len);
       return RfStatus::ERROR;
-    std::memcpy(out, body, body_len);
-    *out_len = body_len;
-    ESP_LOGW(TAG, "rf_unpack_: CRC-OK but unexpected reply layout (%zu-byte body)", body_len);
+    }
+    // Envelope-level anomalies are REPORTED, not enforced: a matching CRC-16/X.25
+    // over the whole body is already strong proof this is our frame, and the exact
+    // reply-direction rules for these two fields are inferred from captures rather
+    // than specified. Rejecting on them could drop perfectly good replies.
+    if (body[1] != 0x00 || body[2] != 0x01) {
+      ESP_LOGW(TAG, "rf_unpack_: unexpected envelope marker %02X %02X (expected 00 01) - relaying anyway", body[1],
+               body[2]);
+    }
+    if (body[3] != (uint8_t) (olen - 1)) {
+      ESP_LOGD(TAG, "rf_unpack_: HLEN=%u != OLEN-1=%u (reply may use a different rule)", body[3],
+               (unsigned) (olen - 1));
+    }
+
+    const size_t payload_len = body_len - RX_HEADER_LEN;
+    if (payload_len > out_cap) {
+      ESP_LOGW(TAG, "rf_unpack_: payload (%zu) exceeds buffer (%zu)", payload_len, out_cap);
+      return RfStatus::ERROR;
+    }
+    std::memcpy(out, body + RX_HEADER_LEN, payload_len);
+    *out_len = payload_len;
+    ESP_LOGV(TAG, "rf_unpack_: CRC-OK, %zu-byte payload (body %zu, start %zu)", payload_len, body_len, lp);
     return RfStatus::OK;
   }
   ESP_LOGE(TAG, "rf_unpack_: no CRC-OK frame in %zu bytes", packet_len);
@@ -605,10 +653,17 @@ RfStatus UartNartisRfComponent::rf_unpack_(const uint8_t *packet, size_t packet_
 
 RfStatus UartNartisRfComponent::rf_start_transmit_(const uint8_t *packet, size_t len) {
   // hal_.transmit() is synchronous: applies the TX profile, pads + bit-reverses,
-  // fills the FIFO, GO_TX, and blocks until TX_DONE (or ~600 ms). It blocks the
-  // loop only for the frame's airtime (~tens of ms at 1.2 kbps).
+  // fills the FIFO, GO_TX, and blocks until TX_DONE or rf_tx_timeout_ms_. It holds
+  // the loop for the frame's airtime (~tens to hundreds of ms at 1.2 kbps), which
+  // is why TX_RF is a pass-through state rather than a polled wait.
   ESP_LOGVV(TAG, "RF TX [%zu]: %s", len, format_hex_pretty(packet, len).c_str());
-  if (!this->hal_.transmit(packet, len)) {
+  // rf_tx_timeout_ms_ bounds a STUCK radio, so it must never be shorter than the
+  // frame's own airtime - otherwise a long request "times out" mid-transmission.
+  // At 1.2 kbps one byte is ~6.7 ms; give that plus 50% margin, whichever is larger.
+  const uint32_t airtime_ms = (uint32_t) len * 20u / 3u;
+  const uint32_t needed_ms = airtime_ms + airtime_ms / 2u + 100u;
+  const uint32_t budget_ms = (needed_ms > this->rf_tx_timeout_ms_) ? needed_ms : this->rf_tx_timeout_ms_;
+  if (!this->hal_.transmit(packet, len, budget_ms)) {
     ESP_LOGW(TAG, "rf_start_transmit_: TX did not complete");
     return RfStatus::ERROR;
   }
@@ -616,7 +671,9 @@ RfStatus UartNartisRfComponent::rf_start_transmit_(const uint8_t *packet, size_t
 }
 
 RfStatus UartNartisRfComponent::rf_transmit_done_() {
-  // hal_.transmit() already blocked until TX_DONE, so TX is complete here.
+  // hal_.transmit() already blocked until TX_DONE (bounded by rf_tx_timeout_ms_)
+  // and a failure there was reported by rf_start_transmit_, so TX is complete here.
+  // The TX_RF state therefore costs exactly one loop() iteration.
   return RfStatus::OK;
 }
 

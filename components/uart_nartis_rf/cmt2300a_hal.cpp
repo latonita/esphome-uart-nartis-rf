@@ -1,5 +1,5 @@
 /*
- * CMT2300A HAL - d101-2 / 443.9 MHz.
+ * CMT2300A HAL - RF433-2 / 443.9 MHz.
  */
 
 #include "cmt2300a_hal.h"
@@ -284,8 +284,11 @@ void Cmt2300aHal::set_rx_center(int off_codes) {
   this->spi_write_reg(FREQUENCY_BANK_ADDR + 3, (code >> 16) & 0xFF);
 }
 
-bool Cmt2300aHal::transmit(const uint8_t *frame, size_t len) {
-  uint8_t fifo[128];
+bool Cmt2300aHal::transmit(const uint8_t *frame, size_t len, uint32_t timeout_ms) {
+  // Sized for the largest frame an 8-bit envelope length can describe: sync(2) +
+  // OLEN(1) + 255 + CRC(2) = 260, plus TX_PAD. A previous 128-byte buffer rejected
+  // any request over ~106 bytes before it ever reached the air.
+  uint8_t fifo[272];
   if (len + TX_PAD > sizeof(fifo)) {
     ESP_LOGW(TAG, "TX frame too big (%zu)", len);
     return false;
@@ -321,7 +324,7 @@ bool Cmt2300aHal::transmit(const uint8_t *frame, size_t len) {
 
   const bool chunked = tot > FIFO_SIZE_MERGED;
   uint32_t t0 = esphome::millis();
-  while (esphome::millis() - t0 < 900) {
+  while (esphome::millis() - t0 < timeout_ms) {
     if (this->spi_read_reg(REG_INT_CLR1) & CLR1_TX_DONE_FLG) {
       this->go_standby();
       const uint32_t dur = esphome::millis() - t0;

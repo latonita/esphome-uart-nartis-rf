@@ -1,5 +1,5 @@
 /*
- * CMT2300A Register Definitions - d101-2 / 443.9 MHz profile.
+ * CMT2300A Register Definitions - RF433-2 / 443.9 MHz profile.
  *
  * Register banks and radio config are the authoritative RFPDK export for
  * 443.9 MHz / GFSK / 1.2 kbps, +20 dBm: narrow (~4 kHz) TX deviation and a
@@ -150,7 +150,7 @@ static constexpr uint8_t FREQ_PALDO_SEL = 0x0;        // TX < 500 MHz
 static constexpr uint8_t FREQ_FSK_SWT = 0x0;          // RFPDK-fixed bit (0x1F bit7), freq-independent
 
 /* ================================================================
- * d101-2 / 443.9 MHz register banks (RFPDK export, from the proven test app).
+ * RF433-2 / 443.9 MHz register banks (RFPDK export, from the proven test app).
  * ================================================================ */
 // clang-format off
 static constexpr uint8_t CMT_BANK[12] = {

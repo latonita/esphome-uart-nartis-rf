@@ -8,10 +8,15 @@ idle gap or an upstream flush()), packed into an RF packet and transmitted; the
 bridge then listens on RF for a reply, unpacks it and serves it back through the
 read side of the virtual UART.
 
-The CMT2300A radio driver (bit-bang SPI HAL), the type-5A DLMS-HDLC envelope
-(build on TX, CRC-carve + unwrap on RX), link-layer ARQ, and the non-blocking
-bridge state machine are all implemented. The operating frequency is derived from
-the meter serial (last 3 digits) and programmed into the CMT2300A per channel.
+The bridge is a transparent pipe: it owns the RF transport only - the on-air
+envelope (sync, length fields, frame-type byte, terminator) and the envelope
+CRC-16/X.25. The relayed bytes are never parsed, so payload framing (HDLC flags,
+FCS, DLMS structure) stays entirely the upstream component's business.
+
+The CMT2300A radio driver (bit-bang SPI HAL), the envelope (build on TX,
+CRC-carve + unwrap on RX), link-layer ARQ, and the bridge state machine are all
+implemented. The operating frequency is derived from the meter serial (last 3
+digits) and programmed into the CMT2300A per channel.
 """
 
 from esphome import pins
@@ -83,12 +88,15 @@ CONFIG_SCHEMA = cv.Schema(
             CONF_REQUEST_GAP, default="100ms"
         ): cv.positive_time_period_milliseconds,
         # How long to wait for the radio to confirm the packet left the antenna
-        # before giving up on this transmission.
+        # before giving up on this transmission. Treated as a floor: the component
+        # raises it to cover the frame's own airtime (~6.7 ms/byte at 1.2 kbps), so
+        # a long request is never cut off mid-transmission.
         cv.Optional(
             CONF_RF_TX_TIMEOUT, default="1000ms"
         ): cv.positive_time_period_milliseconds,
-        # How long to stay in RF RX waiting for a reply before declaring a timeout
-        # and returning to idle.
+        # How long to wait for the FIRST byte of a reply before declaring a timeout.
+        # Once bytes start arriving the frame is allowed to finish (a full-size
+        # 258-byte envelope is ~1.7 s of airtime), bounded by an internal backstop.
         cv.Optional(
             CONF_RF_RX_TIMEOUT, default="1000ms"
         ): cv.positive_time_period_milliseconds,

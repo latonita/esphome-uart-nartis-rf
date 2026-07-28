@@ -1,5 +1,5 @@
 /*
- * Virtual UART <-> RF433 bridge (Nartis) - STUB.
+ * Virtual UART <-> RF433 bridge (Nartis).
  *
  * This component PRESENTS a UART (it is a `uart::UARTComponent`). Any component
  * that talks to a meter "over UART" can bind to this instead of the standard
@@ -7,6 +7,13 @@
  * requests/replies are transparently relayed over a 433 MHz radio. The RF hop is
  * invisible to the upstream component: it writes request bytes and polls for a
  * reply exactly as it would against a real serial link.
+ *
+ * TRANSPARENCY CONTRACT: this is a dumb pipe. It owns the RF transport ONLY -
+ * the on-air envelope (sync, length fields, frame-type byte, terminator) and the
+ * envelope CRC. It never inspects, validates, or depends on the bytes the
+ * upstream handed it: the payload is opaque, and exactly the bytes inside the
+ * reply envelope are handed back. All payload framing (HDLC flags, FCS, DLMS
+ * structure, retry semantics) belongs to the upstream component.
  *
  * Data flow (strictly half-duplex, request/reply):
  *
@@ -17,18 +24,17 @@
  *   reply received over RF     ->  rf_unpack_  ->  push into rx_buffer_
  *   upstream.available()/read_array()  <-- serves the reply back to upstream
  *
- * The RF radio driver and the pack/unpack framing are intentionally left as
- * no-op extension points (rf_*_ methods below). Everything else - the virtual
- * UART interface and the non-blocking bridge state machine - is wired up.
- *
  * Design notes (embedded-safe):
  *   - No heap allocation after setup(): message/packet buffers are fixed-size
  *     std::array; the reply FIFO is a single RingBuffer allocated once in setup().
  *   - Every state that waits on hardware has a timeout; the switch has a default
  *     safe-state branch.
- *   - The radio is only ever driven from loop(); nothing blocks. In particular
- *     flush() does NOT block through an RF round-trip - it only finalizes the
- *     pending request so loop() sends it; the upstream then polls for the reply.
+ *   - The radio is driven only from loop(). RX is fully non-blocking (the FIFO is
+ *     drained in chunks across loop() calls), but TX is synchronous: the HAL
+ *     blocks for the frame's airtime (tens to hundreds of ms at 1.2 kbps, bounded
+ *     by rf_tx_timeout_ms_). flush() does NOT block through an RF round-trip - it
+ *     only finalizes the pending request so loop() sends it; the upstream then
+ *     polls for the reply.
  */
 
 #pragma once
@@ -54,6 +60,15 @@ namespace esphome::uart_nartis_rf {
 static constexpr size_t MAX_UART_MESSAGE_SIZE = 512;
 /// Largest on-air RF packet (payload plus whatever framing overhead is added).
 static constexpr size_t MAX_RF_PACKET_SIZE = 640;
+/// Envelope overhead added to a request by rf_pack_: sync(2) + OLEN(1) + 00 01 +
+/// HLEN(1) + type(1) + serial(6) + terminator(1) + CRC(2).
+static constexpr size_t RF_TX_OVERHEAD = 16;
+/// The envelope length field is one byte, so OLEN <= 255 caps a relayed request at
+/// 255 - (RF_TX_OVERHEAD - sync(2) - OLEN(1) - CRC(2)) bytes of payload.
+static constexpr size_t MAX_RF_PAYLOAD_SIZE = 255 - (RF_TX_OVERHEAD - 5);
+/// Reply direction: body is OLEN(1) + 00 01 + HLEN(1) + payload, so the same 8-bit
+/// OLEN caps an inbound payload at 255 - 3.
+static constexpr size_t MAX_RF_RX_PAYLOAD_SIZE = 255 - 3;
 
 /// Result of an RF operation. I/O helpers return a status instead of void so the
 /// state machine can react to timeouts and errors deterministically.
@@ -85,8 +100,8 @@ class UartNartisRfComponent : public uart::UARTComponent, public Component {
   void set_request_gap_ms(uint32_t ms) { this->request_gap_ms_ = ms; }
   void set_rf_tx_timeout_ms(uint32_t ms) { this->rf_tx_timeout_ms_ = ms; }
   void set_rf_rx_timeout_ms(uint32_t ms) { this->rf_rx_timeout_ms_ = ms; }
-  /// Number of RF retransmissions on no-reply / bad CRC (0 = pure transparent, no
-  /// ARQ). Total on-air attempts per request = 1 + rf_retries.
+  /// Number of RF retransmissions on no-reply / bad envelope CRC (0 = leave all
+  /// retrying to the upstream). Total on-air attempts per request = 1 + rf_retries.
   void set_rf_retries(uint8_t n) { this->rf_retries_ = n; }
   /// RX center offset in frequency codes (1 code ~= 6.199 Hz); centres the RX-half
   /// LO on the meter's reply carrier.
@@ -137,20 +152,19 @@ class UartNartisRfComponent : public uart::UARTComponent, public Component {
   // --- State machine helpers ---
   void set_state_(BridgeState state);
   const LogString *state_to_string_(BridgeState state) const;
-  void begin_rf_tx_();                              // latch the collected request and start the first attempt
-  void start_tx_attempt_();                         // (re)pack the latched request and transmit it
+  void begin_rf_tx_();                              // pack the collected request and start the first attempt
+  void start_tx_attempt_();                         // transmit the already-packed frame
   void retry_or_give_up_(const LogString *reason);  // ARQ: retransmit if attempts remain, else give up
   void finish_rf_rx_(size_t packet_len);            // unpack a received packet into the reply FIFO
   void enter_fault_(const LogString *reason);
   void discard_reply_();  // drop any queued reply + peek cache (resync on a new request)
 
   // ==========================================================================
-  // RF radio extension points - ALL STUBS.
-  //
-  // Replace the bodies in uart_nartis_rf.cpp with the real CC1101 / RF433 driver
-  // calls. Keep the RfStatus contract so the state machine keeps working:
-  //   - rf_pack_/rf_unpack_ : framing (add/remove header, CRC, addressing, ...).
-  //   - rf_start_transmit_  : kick off a (non-blocking) transmit.
+  // RF radio layer (CMT2300A). The RfStatus contract keeps the state machine
+  // deterministic:
+  //   - rf_pack_/rf_unpack_ : envelope only - add/strip header, terminator, CRC.
+  //                           MUST NOT look at the payload bytes.
+  //   - rf_start_transmit_  : transmit one frame (synchronous in this HAL).
   //   - rf_transmit_done_   : poll TX completion (OK done / BUSY / ERROR).
   //   - rf_enter_rx_mode_   : put the radio into receive.
   //   - rf_poll_receive_    : poll for a received packet (OK / NO_DATA / ERROR).
@@ -188,10 +202,10 @@ class UartNartisRfComponent : public uart::UARTComponent, public Component {
   uint32_t frequency_from_address_() const;
 
   // --- Configuration ---
-  uint32_t request_gap_ms_{100};   // idle gap on the write side that ends a request
-  uint32_t rf_tx_timeout_ms_{1000};
-  uint32_t rf_rx_timeout_ms_{1000};
-  uint8_t rf_retries_{2};          // ARQ retransmissions on no-reply/bad-CRC (0 = off)
+  uint32_t request_gap_ms_{100};     // idle gap on the write side that ends a request
+  uint32_t rf_tx_timeout_ms_{1000};  // budget for one transmit incl. airtime (passed to the HAL)
+  uint32_t rf_rx_timeout_ms_{1000};  // how long to wait for the FIRST reply byte
+  uint8_t rf_retries_{2};            // ARQ retransmissions on no-reply/bad-CRC (0 = off)
 
   // --- Runtime state ---
   BridgeState state_{BridgeState::IDLE};
@@ -205,12 +219,12 @@ class UartNartisRfComponent : public uart::UARTComponent, public Component {
   bool req_abandoned_{false};
 
   // --- ARQ (retransmission) state ---
-  // The latched request is kept for the whole exchange so it can be re-packed
-  // (fresh framing/counter) and retransmitted. It is separate from uart_msg_buf_
-  // so the upstream's NEXT request can collect while this one is in flight.
-  std::array<uint8_t, MAX_UART_MESSAGE_SIZE> req_buf_{};
+  // The request is packed ONCE into rf_tx_buf_ and that exact frame is resent on
+  // every attempt (a transparent link-layer retransmit - the envelope carries no
+  // counter or nonce, so re-packing would only reproduce identical bytes).
+  // req_len_ is the in-flight request length; 0 means "no exchange in flight".
   size_t req_len_{0};
-  uint8_t tx_attempts_{0};  // on-air attempts made for the latched request (1 = first send)
+  uint8_t tx_attempts_{0};  // on-air attempts made for the in-flight request (1 = first send)
 
   // --- Diagnostic counters (report; expose as sensors later if wanted) ---
   uint32_t rf_no_reply_count_{0};   // RX windows that ended with no reply
@@ -222,12 +236,22 @@ class UartNartisRfComponent : public uart::UARTComponent, public Component {
   size_t rf_rx_accum_len_{0};
   uint32_t rf_rx_last_chunk_ms_{0};
   /// Stop draining once we have the whole frame (first byte = OLEN => frame is
-  /// OLEN + 3 bytes incl. the 2-byte CRC), or, as a fallback, once a full byte cap
+  /// OLEN + 3 bytes incl. the 2-byte CRC), or, as a fallback, once the byte cap
   /// is reached or no new chunk has arrived for RF_RX_END_GAP_MS. A fixed time
   /// window does NOT work: at 1.2 kbps the FIFO threshold only fires every ~100 ms,
   /// so the frame must be bounded by length, not by elapsed time.
-  static constexpr size_t RF_RX_DRAIN_CAP = 96;
+  ///
+  /// The cap must let the LARGEST envelope the length field can describe arrive in
+  /// full: OLEN(1) + 255 + CRC(2) = 258 bytes. drain_rx() appends whole 15-byte
+  /// chunks and only runs while (accumulated + 15 <= cap), so the cap needs at
+  /// least one spare chunk above 258 -> 288 (a previous value of 96 silently
+  /// truncated every reply longer than ~90 bytes into an endless retry loop).
+  static constexpr size_t RF_RX_DRAIN_CAP = 288;
   static constexpr uint32_t RF_RX_END_GAP_MS = 400;
+  /// Absolute ceiling on one RX window once bytes have started arriving.
+  /// rf_rx_timeout_ms_ only bounds the wait for the FIRST byte: it must not cut a
+  /// frame short, since 258 bytes at 1.2 kbps is ~1.7 s of pure airtime.
+  static constexpr uint32_t RF_RX_MAX_WINDOW_MS = 5000;
 
   // --- RX center offset (freq codes; 1 code ~= 6.199 Hz) ---
   // The meter's reply sits a few kHz above our TX; this shifts the RX-half LO to

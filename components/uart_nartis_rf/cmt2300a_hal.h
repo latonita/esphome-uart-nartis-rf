@@ -1,5 +1,5 @@
 /*
- * CMT2300A Hardware Abstraction Layer - d101-2 / 443.9 MHz.
+ * CMT2300A Hardware Abstraction Layer - RF433-2 / 443.9 MHz.
  *
  * Bit-bang 3-wire SPI driver for the CMT2300A. Fixed 443.9 MHz. Asymmetric channel:
  *   - TX: narrow ~4 kHz deviation, HW sync blended to 0x55, real 98 f3 carried in
@@ -44,11 +44,12 @@ class Cmt2300aHal {
   /// Read product ID (0x66 for CMT2300A) - wiring/comms sanity check.
   bool is_chip_connected();
 
-  /// Transmit one d101-2 frame (starts with 98 f3, ends with its CRC). Applies the
+  /// Transmit one RF433-2 frame (starts with 98 f3, ends with its CRC). Applies the
   /// TX profile, prepends a 0x55 pad, bit-reverses to LSB-first on air, fills the
-  /// FIFO, and blocks until TX_DONE or ~600 ms. Returns true on TX_DONE. Parks the
-  /// chip in standby afterwards.
-  bool transmit(const uint8_t *frame, size_t len);
+  /// FIFO (refilling as it drains), and blocks until TX_DONE or timeout_ms. Returns
+  /// true on TX_DONE. Parks the chip in standby afterwards. Budget the timeout for
+  /// airtime: at 1.2 kbps a byte is ~6.7 ms, so a 260-byte frame needs ~1.8 s.
+  bool transmit(const uint8_t *frame, size_t len, uint32_t timeout_ms = 900);
 
   /// Enter RX centred at (rf_freq_hz_ + off_codes * 6.199 Hz): applies the wide RX
   /// profile + 2-byte sync + chip bit-order, then RFS -> RX. Returns true if RX
