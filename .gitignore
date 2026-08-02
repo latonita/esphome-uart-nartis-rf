@@ -146,3 +146,6 @@ sdkconfig.*
 # Local-only notes (internal source references), not for the public repo
 *.local.md
 *.local.txt
+
+# Semgrep plugin scratch output
+.semgrep/
