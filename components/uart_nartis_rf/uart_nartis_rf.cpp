@@ -543,7 +543,7 @@ RfStatus UartNartisRfComponent::rf_pack_(const uint8_t *payload, size_t payload_
   // (request direction):
   //   98 F3 | OLEN | 00 01 | HLEN | TYPE | serial(6) | <payload> | A5 | CRC16(LE)
   //   OLEN = len(00 01 | HLEN | TYPE | serial | payload | A5)  (after OLEN, excl. CRC)
-  //   HLEN = OLEN - 1   (bytes following HLEN, counting the 2 envelope CRC bytes)
+  //   HLEN = OLEN ^ 1   (see below)
   //   CRC  = CRC-16/X.25 over [OLEN .. A5], little-endian
   // The 0xA5 terminator is REQUIRED (the meter ignores frames without it).
   // The HAL adds the 0x55 pad and the LSB-first bit-reversal.
@@ -554,7 +554,15 @@ RfStatus UartNartisRfComponent::rf_pack_(const uint8_t *payload, size_t payload_
     return RfStatus::ERROR;
   }
   const size_t olen = 2 + 1 + 1 + 6 + payload_len + 1;  // 00 01 + HLEN + TYPE + serial(6) + payload + A5
-  const size_t hlen = olen - 1;
+  // HLEN = OLEN ^ 1. This was OLEN - 1, which is the same thing for odd OLEN and
+  // differs for even. Every even-length frame seen from the meter uses OLEN ^ 1:
+  // two replies on this link (OLEN 24 -> 25, 12 -> 13), the D101-2 display's own
+  // status poll (0x12 -> 0x13) and the DI 0xF202 reply (0x60 -> 0x61). No
+  // counterexample.
+  //
+  // The field is ignored on receive - the meter answers frames built either way -
+  // so this is about matching the real display exactly, not about working at all.
+  const size_t hlen = olen ^ 1;
   const size_t total = 2 + 1 + olen + 2;  // sync(2) + OLEN(1) + content(olen) + CRC(2)
   if (payload_len > MAX_RF_PAYLOAD_SIZE) {
     ESP_LOGW(TAG, "rf_pack_: request of %zu bytes exceeds the %zu-byte on-air limit (8-bit length field)", payload_len,
@@ -572,7 +580,7 @@ RfStatus UartNartisRfComponent::rf_pack_(const uint8_t *payload, size_t payload_
   out[p++] = (uint8_t) olen;  // OLEN
   out[p++] = 0x00;
   out[p++] = 0x01;
-  out[p++] = (uint8_t) hlen;  // HLEN = OLEN - 1
+  out[p++] = (uint8_t) hlen;  // HLEN = OLEN ^ 1
   out[p++] = RF433_2_TYPE_REQUEST;
   for (size_t i = 0; i < 6; i++)
     out[p++] = this->serial_le_[i];
@@ -632,9 +640,8 @@ RfStatus UartNartisRfComponent::rf_unpack_(const uint8_t *packet, size_t packet_
       ESP_LOGW(TAG, "rf_unpack_: unexpected envelope marker %02X %02X (expected 00 01) - relaying anyway", body[1],
                body[2]);
     }
-    if (body[3] != (uint8_t) (olen - 1)) {
-      ESP_LOGD(TAG, "rf_unpack_: HLEN=%u != OLEN-1=%u (reply may use a different rule)", body[3],
-               (unsigned) (olen - 1));
+    if (body[3] != (uint8_t) (olen ^ 1)) {
+      ESP_LOGD(TAG, "rf_unpack_: HLEN=%u, expected OLEN^1=%u", body[3], (unsigned) (olen ^ 1));
     }
 
     const size_t payload_len = body_len - RX_HEADER_LEN;
