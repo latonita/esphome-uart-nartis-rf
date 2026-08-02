@@ -418,11 +418,14 @@ const LogString *UartNartisRfComponent::state_to_string_(BridgeState state) cons
 }
 
 uint32_t UartNartisRfComponent::frequency_from_address_() const {
-  // n3 = value of the last 3 digits; k = n3 % 24;
-  // freq = 435.5 MHz + k * 0.7 MHz, plus 100 kHz when k > 18.
+  // n3 = value of the last 3 digits; k = n3 % 24; freq = 435.5 MHz + k * 0.7 MHz.
   //
-  // The full k -> frequency table (uniform 0.7 MHz step for k 0..18; the +100 kHz
-  // for k > 18 makes the k=18->19 gap 0.8 MHz, then 0.7 MHz again):
+  // A uniform 0.7 MHz step across the whole grid. There used to be a +100 kHz
+  // special case for k > 18; SPI captures of a real d101-2 display disprove it.
+  // Three adjacent serials sharing one frequency bank step FREQ_CHNL by exactly
+  // +8 per k (k=17 -> 0x00, k=18 -> 0x08, k=19 -> 0x10) with FREQ_OFS constant,
+  // and a uniform channel step means a uniform frequency step - an extra 100 kHz
+  // at k=19 would have required FREQ_CHNL ~17, not 16.
   //
   //   k   freq (Hz)      MHz        k   freq (Hz)      MHz
   //   --  -----------  --------     --  -----------  --------
@@ -433,11 +436,14 @@ uint32_t UartNartisRfComponent::frequency_from_address_() const {
   //    4  438 300 000  438.300      16  446 700 000  446.700
   //    5  439 000 000  439.000      17  447 400 000  447.400
   //    6  439 700 000  439.700      18  448 100 000  448.100
-  //    7  440 400 000  440.400      19  448 900 000  448.900  (+100 kHz)
-  //    8  441 100 000  441.100      20  449 600 000  449.600  (+100 kHz)
-  //    9  441 800 000  441.800      21  450 300 000  450.300  (+100 kHz)
-  //   10  442 500 000  442.500      22  451 000 000  451.000  (+100 kHz)
-  //   11  443 200 000  443.200      23  451 700 000  451.700  (+100 kHz)
+  //    7  440 400 000  440.400      19  448 800 000  448.800
+  //    8  441 100 000  441.100      20  449 500 000  449.500
+  //    9  441 800 000  441.800      21  450 200 000  450.200
+  //   10  442 500 000  442.500      22  450 900 000  450.900
+  //   11  443 200 000  443.200      23  451 600 000  451.600
+  //
+  // Confirmed on air at k=12 (443.900, serial ...271060) and k=17 (447.400,
+  // serial ...003137).
   //
   // n3 (000..999) maps to k by n3 % 24, so each k is hit by ~42 last-3-digit
   // values (e.g. "...060" -> 60 % 24 = 12 -> 443.900 MHz).
@@ -451,11 +457,7 @@ uint32_t UartNartisRfComponent::frequency_from_address_() const {
     }
   }
   const uint32_t k = n3 % 24;
-  uint32_t freq = 435500000u + k * 700000u;
-  if (k > 18) {
-    freq += 100000u;
-  }
-  return freq;
+  return 435500000u + k * 700000u;
 }
 
 // ============================================================================
