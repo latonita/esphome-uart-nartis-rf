@@ -252,16 +252,38 @@ void Cmt2300aHal::init_tx() {
 }
 
 // ================= RX INIT (before each receive) =================
-// 2-byte sync 98 f3 (chip bytes 19 CF), chip bit-order flip, wide ~28 kHz profile
-// centred on the reply, FIFO -> RX on RX_FIFO_TH.
+// 3-byte sync 55 19 CF (= the last preamble byte plus 98 f3), chip bit-order flip, wide
+// ~28 kHz profile centred on the reply, FIFO -> RX on RX_FIFO_TH.
 void Cmt2300aHal::init_rx(int off_codes) {
   this->spi_write_reg(REG_MODE_CTL, GO_STBY);
   this->wait_for_state(STA_STBY);
-  this->spi_write_reg(REG_PKT5, 0x22);       // SYNC_TOL=2, SYNC_SIZE=1 (2 bytes)
-  this->spi_write_reg(REG_PKT13, 0x19);      // SYNC_VALUE<63:56> = first byte  (on-air 0x98)
-  this->spi_write_reg(REG_PKT12, 0xCF);      // SYNC_VALUE<55:48> = second byte (on-air 0xf3)
+  // 3-byte sync at zero tolerance, taken verbatim from the original D101-2 display's
+  // register bank (PKT5=0x04, 0x44=55 0x43=19 0x42=CF - identical in all six SPI dumps of
+  // it and never rewritten between TX and RX). Same 443.9 MHz PHY as the display and the
+  // nartis_rf_2_meter component, so the framing is the same here.
+  //
+  // Sync bytes sit in on-air order descending from PKT13, held in the on-air (bit-reversed)
+  // domain: 55 19 CF on air is AA 98 F3 in frame terms. The leading AA is simply the last
+  // preamble byte - everything on this link emits 0x55 on air ahead of the sync, so folding
+  // one byte in costs nothing and narrows the match window 256x.
+  //
+  // SYNC_TOL=0 because tolerance was only ever helping noise. Measured on a week of
+  // nartis_rf_2_meter traffic over this exact PHY: a 2-byte sync at TOL=2 accepts 137 of
+  // 65536 patterns and was locking onto noise ahead of the reply on ~10% of attempts, while
+  // every reply whose body arrived intact had a sync word with zero bit errors. Replayed
+  // over 2.16 M bits of that live channel, TOL=0 with the 3-byte window finds the same 816
+  // genuine syncs and drops false alarms from 1330 to 1.
+  //
+  // The FIFO still starts at the frame's own length byte, so the packet layer is unaffected.
+  this->spi_write_reg(REG_PKT5, 0x04);       // SYNC_TOL=0, SYNC_SIZE=2 (3 bytes)
+  this->spi_write_reg(REG_PKT13, 0x55);      // SYNC_VALUE<63:56> = 1st byte on air (frame 0xAA)
+  this->spi_write_reg(REG_PKT12, 0x19);      // SYNC_VALUE<55:48> = 2nd byte on air (frame 0x98)
+  this->spi_write_reg(REG_PKT11, 0xCF);      // SYNC_VALUE<47:40> = 3rd byte on air (frame 0xf3)
   this->spi_write_reg(REG_PKT14, 0x12);      // PAYLOAD_BIT_ORDER=1 (chip flips bits) + fixed length
   this->spi_write_reg(REG_PKT15, 0xFF);      // fixed length ceiling 0x1FF (511)
+  // The ceiling stays at the 511 maximum here. The display runs a 180-byte fixed RX length
+  // and nartis_rf_2_meter now matches it, but this bridge accepts RX payloads up to
+  // MAX_RF_RX_PAYLOAD_SIZE (252), so 180 would truncate large frames - do not port it.
   this->update_reg(REG_INT2_CTL, MASK_INT2_SEL, INT_SEL_RX_FIFO_TH);
   this->update_reg(REG_FIFO_CTL, MASK_FIFO_RX_TX_SEL | MASK_SPI_FIFO_RD_WR_SEL, 0x00);  // FIFO -> RX read
   this->spi_write_reg(REG_FIFO_CLR, FIFO_RESTORE | FIFO_CLR_RX | FIFO_CLR_TX);
