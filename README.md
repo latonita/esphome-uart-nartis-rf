@@ -69,10 +69,13 @@ uart_nartis_rf:
 dlms_cosem:
   id: nartis_dlms
   uart_id: nartis_rf_uart
-  client_address: 32
+
+  client_address: 32  # Также в природе замечена рабочая конфигурация с клиентским адресом 17 и паролем "00000001"
   server_address: 1
   auth: true
   password: "00002080" # Пароль доступа. Ваш пароль может быть другим - проверьте паспорт на ваш прибор учета.
+
+
   receive_timeout: 5000ms
   update_interval: 300s
 ```
