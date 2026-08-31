@@ -418,35 +418,9 @@ const LogString *UartNartisRfComponent::state_to_string_(BridgeState state) cons
 }
 
 uint32_t UartNartisRfComponent::frequency_from_address_() const {
-  // n3 = value of the last 3 digits; k = n3 % 24; freq = 435.5 MHz + k * 0.7 MHz.
-  //
-  // A uniform 0.7 MHz step across the whole grid. There used to be a +100 kHz
-  // special case for k > 18; SPI captures of a real d101-2 display disprove it.
-  // Three adjacent serials sharing one frequency bank step FREQ_CHNL by exactly
-  // +8 per k (k=17 -> 0x00, k=18 -> 0x08, k=19 -> 0x10) with FREQ_OFS constant,
-  // and a uniform channel step means a uniform frequency step - an extra 100 kHz
-  // at k=19 would have required FREQ_CHNL ~17, not 16.
-  //
-  //   k   freq (Hz)      MHz        k   freq (Hz)      MHz
-  //   --  -----------  --------     --  -----------  --------
-  //    0  435 500 000  435.500      12  443 900 000  443.900
-  //    1  436 200 000  436.200      13  444 600 000  444.600
-  //    2  436 900 000  436.900      14  445 300 000  445.300
-  //    3  437 600 000  437.600      15  446 000 000  446.000
-  //    4  438 300 000  438.300      16  446 700 000  446.700
-  //    5  439 000 000  439.000      17  447 400 000  447.400
-  //    6  439 700 000  439.700      18  448 100 000  448.100
-  //    7  440 400 000  440.400      19  448 800 000  448.800
-  //    8  441 100 000  441.100      20  449 500 000  449.500
-  //    9  441 800 000  441.800      21  450 200 000  450.200
-  //   10  442 500 000  442.500      22  450 900 000  450.900
-  //   11  443 200 000  443.200      23  451 600 000  451.600
-  //
-  // Confirmed on air at k=12 (443.900, serial ...271060) and k=17 (447.400,
-  // serial ...003137).
-  //
-  // n3 (000..999) maps to k by n3 % 24, so each k is hit by ~42 last-3-digit
-  // values (e.g. "...060" -> 60 % 24 = 12 -> 443.900 MHz).
+  // k = last3(serial) % 24; freq = 435.5 MHz + k * 0.7 MHz, plus 100 kHz once
+  // k > 18. Confirmed on air at k=12 (443.900), k=13 (444.600) and k=20
+  // (449.600) - the last of these is what pins the k > 18 step. k=17 unverified.
   uint32_t n3 = 0;
   const size_t len = this->address_.size();
   const size_t start = (len >= 3) ? (len - 3) : 0;
@@ -457,7 +431,7 @@ uint32_t UartNartisRfComponent::frequency_from_address_() const {
     }
   }
   const uint32_t k = n3 % 24;
-  return 435500000u + k * 700000u;
+  return CHANNEL_BASE_HZ + k * CHANNEL_STEP_HZ + (k > CHANNEL_STEP_BREAK ? CHANNEL_STEP_EXTRA_HZ : 0u);
 }
 
 // ============================================================================

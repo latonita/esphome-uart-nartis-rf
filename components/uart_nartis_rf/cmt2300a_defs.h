@@ -142,6 +142,13 @@ static constexpr float RX_CODE_HZ = 6.199f;
  *              0x1C TX_N | 0x1D-0x1E TX_K[15:0] | 0x1F [FSK_SWT|VCO_BANK|TX_K[19:16]]
  * ================================================================ */
 static constexpr uint32_t XTAL_HZ = 26000000u;
+// Meter channel grid: k = last3(serial) % 24, freq = BASE + k * STEP, plus EXTRA
+// once k > BREAK. The k=18 -> 19 step is 800 kHz; every other step is 700 kHz.
+static constexpr uint32_t CHANNEL_BASE_HZ = 435500000u;
+static constexpr uint32_t CHANNEL_STEP_HZ = 700000u;
+static constexpr uint32_t CHANNEL_STEP_BREAK = 18u;
+static constexpr uint32_t CHANNEL_STEP_EXTRA_HZ = 100000u;
+
 static constexpr uint32_t FREQ_DIVIDER = 4u;          // 420-510 MHz band
 static constexpr uint32_t FREQ_IF_HZ = XTAL_HZ / 92;  // RX LO offset above RF (282608 Hz)
 static constexpr uint8_t FREQ_VCO_BANK = 0x1;         // <2:0>, 420-510 MHz
