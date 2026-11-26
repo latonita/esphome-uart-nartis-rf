@@ -3,12 +3,26 @@
 #include "esphome/core/log.h"
 #include "esphome/core/hal.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstring>
 
 namespace esphome::uart_nartis_rf {
 
 static const char *const TAG = "uart_nartis_rf";
+
+// Hex dump at VERY_VERBOSE, split into short lines: keeps the stack buffer small
+// and stays under the logger's line length limit.
+static void log_hex(const char *dir, const uint8_t *data, size_t len) {
+#if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_VERY_VERBOSE
+  static constexpr size_t CHUNK = 32;
+  char hex_buf[format_hex_pretty_size(CHUNK)];
+  for (size_t off = 0; off < len; off += CHUNK) {
+    size_t n = std::min(CHUNK, len - off);
+    ESP_LOGVV(TAG, "%s[%u]: %s", dir, static_cast<unsigned>(off), format_hex_pretty_to(hex_buf, data + off, n, '.'));
+  }
+#endif
+}
 
 void UartNartisRfComponent::setup() {
   // The reply FIFO is the only heap allocation, done once here.
@@ -330,8 +344,7 @@ void UartNartisRfComponent::finish_rf_rx_(size_t packet_len) {
     return;
   }
 
-  ESP_LOGVV(TAG, "RF RX raw [%zu]: %s", packet_len,
-           format_hex_pretty(this->rf_rx_buf_.data(), packet_len).c_str());
+  log_hex("RX", this->rf_rx_buf_.data(), packet_len);
 
   size_t unpacked_len = 0;
   const RfStatus st = this->rf_unpack_(this->rf_rx_buf_.data(), packet_len, this->unpack_buf_.data(),
@@ -346,8 +359,7 @@ void UartNartisRfComponent::finish_rf_rx_(size_t packet_len) {
 
   // Success: the latched request is done.
   this->req_len_ = 0;
-  ESP_LOGVV(TAG, "RF RX payload [%zu]: %s", unpacked_len,
-           format_hex_pretty(this->unpack_buf_.data(), unpacked_len).c_str());
+  log_hex("RX payload", this->unpack_buf_.data(), unpacked_len);
 
   if (unpacked_len > 0 && this->rx_buffer_ != nullptr) {
     const size_t written = this->rx_buffer_->write(this->unpack_buf_.data(), unpacked_len);
@@ -639,7 +651,7 @@ RfStatus UartNartisRfComponent::rf_start_transmit_(const uint8_t *packet, size_t
   // fills the FIFO, GO_TX, and blocks until TX_DONE or rf_tx_timeout_ms_. It holds
   // the loop for the frame's airtime (~tens to hundreds of ms at 1.2 kbps), which
   // is why TX_RF is a pass-through state rather than a polled wait.
-  ESP_LOGVV(TAG, "RF TX [%zu]: %s", len, format_hex_pretty(packet, len).c_str());
+  log_hex("TX", packet, len);
   // rf_tx_timeout_ms_ bounds a STUCK radio, so it must never be shorter than the
   // frame's own airtime - otherwise a long request "times out" mid-transmission.
   // At 1.2 kbps one byte is ~6.7 ms; give that plus 50% margin, whichever is larger.
